@@ -1,4 +1,3 @@
-```markdown
 # Ethereum NFT Tracker
 
 This Python script retrieves the latest block from the Ethereum blockchain, extracts all wallet addresses involved in transactions within that block, checks for NFTs held by these addresses, and outputs the results. The script uses the Etherscan API for interacting with the Ethereum blockchain.
