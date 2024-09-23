@@ -97,8 +97,8 @@ def save_nft_addresses(nft_addresses):
         logging.info("No NFT addresses to save.")
         return
     
-    with open(OUTPUT_FILE, 'w') as f:
-        f.write('\n'.join(nft_addresses))
+    with open(OUTPUT_FILE, 'a') as f:  # Change to append mode
+        f.write('\n'.join(nft_addresses) + '\n')
     
     logging.info(f'NFT addresses saved to {OUTPUT_FILE}')
 
