@@ -67,10 +67,7 @@ def get_block_transactions(block_number):
     data = make_request(url)
     transactions = data['result']['transactions']
     
-    addresses = {tx['from'] for tx in transactions if tx.get('from')}
-    addresses.update({tx['to'] for tx in transactions if tx.get('to')})
-    
-    return addresses
+    return {tx['from'] for tx in transactions if tx.get('from')} | {tx['to'] for tx in transactions if tx.get('to')}
 
 def get_nfts_for_address(address):
     """
@@ -96,42 +93,46 @@ def save_nft_addresses(nft_addresses):
     if not nft_addresses:
         logging.info("No NFT addresses to save.")
         return
-    
-    with open(OUTPUT_FILE, 'a') as f:  # Change to append mode
+
+    with open(OUTPUT_FILE, 'a') as f:
         f.write('\n'.join(nft_addresses) + '\n')
-    
+
     logging.info(f'NFT addresses saved to {OUTPUT_FILE}')
 
+def process_block():
+    """Process a single block and extract NFT addresses."""
+    latest_block = get_latest_block()
+    logging.info(f'Latest Block: {latest_block}')
+
+    addresses = get_block_transactions(latest_block)
+    if not addresses:
+        logging.info("No addresses found in the latest block.")
+        return
+
+    logging.info(f'Addresses in Block: {addresses}')
+
+    nft_addresses = set()
+    for address in addresses:
+        nft_addresses.update(get_nfts_for_address(address))
+
+    if nft_addresses:
+        logging.info(f'NFT Addresses: {nft_addresses}')
+        save_nft_addresses(nft_addresses)
+    else:
+        logging.info('No NFT addresses found.')
+
 def main():
-    """Main function to fetch and save NFT addresses."""
-    try:
-        latest_block = get_latest_block()
-        logging.info(f'Latest Block: {latest_block}')
-
-        addresses = get_block_transactions(latest_block)
-        if not addresses:
-            logging.info("No addresses found in the latest block.")
-            return
-
-        logging.info(f'Addresses in Block: {addresses}')
-
-        nft_addresses = set()
-        for address in addresses:
-            nft_addresses.update(get_nfts_for_address(address))
-
-        if nft_addresses:
-            logging.info(f'NFT Addresses: {nft_addresses}')
-            save_nft_addresses(nft_addresses)
-        else:
-            logging.info('No NFT addresses found.')
-
-    except requests.RequestException as e:
-        logging.error(f"Network error: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-
-if __name__ == '__main__':
+    """Main function to continually fetch and save NFT addresses."""
     while True:
-        main()
+        try:
+            process_block()
+        except requests.RequestException as e:
+            logging.error(f"Network error: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}")
+        
         logging.info(f'Waiting for {SLEEP_INTERVAL} seconds before the next iteration...')
         sleep(SLEEP_INTERVAL)
+
+if __name__ == '__main__':
+    main()
