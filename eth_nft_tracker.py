@@ -10,16 +10,16 @@ from urllib.parse import urljoin
 # Configuration
 ETHERSCAN_API_KEY = 'YOUR_ETHERSCAN_API_KEY'
 ETHERSCAN_BASE_URL = 'https://api.etherscan.io/api'
-SLEEP_INTERVAL = 60  # Interval between requests in seconds
+SLEEP_INTERVAL = 60  # Interval between processing blocks (seconds)
 OUTPUT_FILE = 'nft_addresses.txt'
-REQUEST_TIMEOUT = 10  # Timeout for HTTP requests in seconds
+REQUEST_TIMEOUT = 10  # HTTP request timeout (seconds)
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def signal_handler(sig: int, frame) -> None:
-    """Handle graceful shutdown on interrupt signals."""
-    logging.info('Stopping the script...')
+    """Gracefully exit the script on interruption signals."""
+    logging.info('Terminating the script...')
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -27,70 +27,97 @@ signal.signal(signal.SIGINT, signal_handler)
 @retry(wait_fixed=2000, stop_max_attempt_number=5)
 def make_request(url: str) -> dict:
     """
-    Make a GET request to the specified URL with retries on failure.
+    Perform a GET request to the given URL with retry logic on failure.
 
     Args:
-        url (str): The URL to request.
+        url (str): The API endpoint to query.
 
     Returns:
-        dict: The JSON response.
+        dict: Parsed JSON response.
     """
     try:
-        logging.debug(f"Making request to URL: {url}")
+        logging.debug(f"Requesting URL: {url}")
         response = requests.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as e:
-        logging.error(f"Request failed: {e}")
+        logging.error(f"Error during request: {e}")
         raise
 
 def get_latest_block() -> int:
-    """Retrieve the latest Ethereum block number."""
+    """Fetch the latest Ethereum block number."""
     url = urljoin(ETHERSCAN_BASE_URL, f'?module=proxy&action=eth_blockNumber&apikey={ETHERSCAN_API_KEY}')
     data = make_request(url)
     try:
-        return int(data.get('result', '0'), 16)
+        block_number = int(data.get('result', '0'), 16)
+        logging.debug(f"Latest block number: {block_number}")
+        return block_number
     except (ValueError, KeyError):
-        logging.error("Failed to parse block number from response.")
+        logging.error("Failed to parse the block number from the API response.")
         return 0
 
 def get_block_transactions(block_number: int) -> set[str]:
-    """Retrieve unique addresses involved in transactions from a specific block."""
+    """
+    Retrieve unique Ethereum addresses from transactions in a specific block.
+
+    Args:
+        block_number (int): Block number to query.
+
+    Returns:
+        set[str]: Set of unique Ethereum addresses.
+    """
     url = urljoin(ETHERSCAN_BASE_URL, f'?module=proxy&action=eth_getBlockByNumber&tag=0x{block_number:x}&boolean=true&apikey={ETHERSCAN_API_KEY}')
     data = make_request(url)
     transactions = data.get('result', {}).get('transactions', [])
-
-    return {tx.get('from') for tx in transactions if tx.get('from')} | {tx.get('to') for tx in transactions if tx.get('to')}
+    addresses = {tx.get('from') for tx in transactions if tx.get('from')} | \
+                {tx.get('to') for tx in transactions if tx.get('to')}
+    logging.debug(f"Addresses in block {block_number}: {addresses}")
+    return addresses
 
 def get_nfts_for_address(address: str) -> set[str]:
-    """Retrieve NFT contract addresses associated with a specific Ethereum address."""
+    """
+    Fetch NFT contract addresses associated with a specific Ethereum address.
+
+    Args:
+        address (str): Ethereum address to query.
+
+    Returns:
+        set[str]: Set of NFT contract addresses.
+    """
     url = urljoin(ETHERSCAN_BASE_URL, f'?module=account&action=tokennfttx&address={address}&startblock=0&endblock=999999999&sort=asc&apikey={ETHERSCAN_API_KEY}')
     data = make_request(url)
-    return {nft.get('contractAddress') for nft in data.get('result', []) if 'contractAddress' in nft}
+    nft_addresses = {nft.get('contractAddress') for nft in data.get('result', []) if 'contractAddress' in nft}
+    logging.debug(f"NFTs for address {address}: {nft_addresses}")
+    return nft_addresses
 
 def save_nft_addresses(nft_addresses: set[str]) -> None:
-    """Save NFT contract addresses to a file."""
+    """
+    Persist NFT contract addresses to a file.
+
+    Args:
+        nft_addresses (set[str]): Set of NFT addresses to save.
+    """
     if nft_addresses:
         try:
-            with open(OUTPUT_FILE, 'a') as f:
-                f.write('\n'.join(nft_addresses) + '\n')
-            logging.info(f"Saved {len(nft_addresses)} NFT addresses to {OUTPUT_FILE}")
+            with open(OUTPUT_FILE, 'a') as file:
+                file.write('\n'.join(nft_addresses) + '\n')
+            logging.info(f"Saved {len(nft_addresses)} NFT addresses to {OUTPUT_FILE}.")
         except IOError as e:
-            logging.error(f"Failed to save NFT addresses: {e}")
+            logging.error(f"Failed to write NFT addresses to file: {e}")
     else:
-        logging.info("No new NFT addresses to save.")
+        logging.info("No NFT addresses to save.")
 
 def process_block() -> None:
-    """Process the latest block and extract NFT addresses."""
+    """Process the latest Ethereum block and extract NFT contract addresses."""
     latest_block = get_latest_block()
     if latest_block == 0:
-        logging.error("Failed to retrieve a valid block number.")
+        logging.error("Invalid block number retrieved. Skipping this iteration.")
         return
 
     logging.info(f"Processing block: {latest_block}")
     addresses = get_block_transactions(latest_block)
     if not addresses:
-        logging.info("No addresses found in the latest block.")
+        logging.info("No transactions found in the block.")
         return
 
     nft_addresses = set()
@@ -100,7 +127,7 @@ def process_block() -> None:
     save_nft_addresses(nft_addresses)
 
 def main() -> None:
-    """Continuously fetch and save NFT addresses from the blockchain."""
+    """Continuously fetch and process blocks for NFT contract addresses."""
     while True:
         try:
             process_block()
@@ -109,7 +136,7 @@ def main() -> None:
         except Exception as e:
             logging.error(f"Unexpected error: {e}")
         
-        logging.info(f"Waiting {SLEEP_INTERVAL} seconds for the next iteration...")
+        logging.info(f"Sleeping for {SLEEP_INTERVAL} seconds...")
         sleep(SLEEP_INTERVAL)
 
 if __name__ == '__main__':
