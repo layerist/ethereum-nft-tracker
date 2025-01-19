@@ -47,7 +47,7 @@ def make_request(url: str) -> dict:
         response.raise_for_status()
         return response.json()
     except requests.RequestException as e:
-        logging.error(f"Error during request: {e}")
+        logging.error(f"Request failed: {e}")
         raise
 
 
@@ -57,10 +57,10 @@ def get_latest_block() -> int:
     data = make_request(url)
     try:
         block_number = int(data.get('result', '0'), 16)
-        logging.info(f"Retrieved latest block number: {block_number}")
+        logging.info(f"Latest block number: {block_number}")
         return block_number
-    except (ValueError, KeyError):
-        logging.error("Failed to parse the block number from the API response.")
+    except (ValueError, KeyError) as e:
+        logging.error(f"Error parsing block number: {e}")
         return 0
 
 
@@ -96,7 +96,7 @@ def get_nfts_for_address(address: str) -> Set[str]:
     url = urljoin(ETHERSCAN_BASE_URL, f'?module=account&action=tokennfttx&address={address}&startblock=0&endblock=999999999&sort=asc&apikey={ETHERSCAN_API_KEY}')
     data = make_request(url)
     nft_addresses = {nft.get('contractAddress') for nft in data.get('result', []) if nft.get('contractAddress')}
-    logging.debug(f"Found {len(nft_addresses)} NFT contract addresses for {address}.")
+    logging.debug(f"{len(nft_addresses)} NFT contract addresses found for {address}.")
     return nft_addresses
 
 
@@ -113,7 +113,7 @@ def save_nft_addresses(nft_addresses: Set[str]) -> None:
                 file.write('\n'.join(nft_addresses) + '\n')
             logging.info(f"Saved {len(nft_addresses)} NFT addresses to {OUTPUT_FILE}.")
         except IOError as e:
-            logging.error(f"Failed to write NFT addresses to file: {e}")
+            logging.error(f"File writing error: {e}")
     else:
         logging.info("No NFT addresses to save.")
 
@@ -122,13 +122,13 @@ def process_block() -> None:
     """Process the latest Ethereum block and extract NFT contract addresses."""
     latest_block = get_latest_block()
     if latest_block == 0:
-        logging.error("Invalid block number retrieved. Skipping this iteration.")
+        logging.error("Invalid block number. Skipping this iteration.")
         return
 
-    logging.info(f"Processing block: {latest_block}")
+    logging.info(f"Processing block {latest_block}")
     addresses = get_block_transactions(latest_block)
     if not addresses:
-        logging.info("No transactions found in the block.")
+        logging.info("No transactions found in this block.")
         return
 
     nft_addresses = set()
