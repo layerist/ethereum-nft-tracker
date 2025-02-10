@@ -1,11 +1,9 @@
-import requests
-import json
+import aiohttp
+import asyncio
+import logging
 import signal
 import sys
-import logging
-from time import sleep
-from retrying import retry
-from urllib.parse import urljoin
+from time import time
 from typing import Set
 
 # Configuration
@@ -15,142 +13,89 @@ SLEEP_INTERVAL = 60  # Interval between processing blocks (seconds)
 OUTPUT_FILE = 'nft_addresses.txt'
 REQUEST_TIMEOUT = 10  # HTTP request timeout (seconds)
 MAX_RETRIES = 5
-RETRY_DELAY_MS = 2000
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
-def signal_handler(sig: int, frame) -> None:
-    """Gracefully exit the script on interruption signals."""
-    logging.info('Terminating the script...')
+# Graceful exit handler
+def signal_handler(sig, frame):
+    logging.info("Terminating the script...")
     sys.exit(0)
-
 
 signal.signal(signal.SIGINT, signal_handler)
 
-
-@retry(wait_fixed=RETRY_DELAY_MS, stop_max_attempt_number=MAX_RETRIES)
-def make_request(url: str) -> dict:
-    """
-    Perform a GET request to the given URL with retry logic on failure.
-
-    Args:
-        url (str): The API endpoint to query.
-
-    Returns:
-        dict: Parsed JSON response.
-    """
-    try:
-        logging.debug(f"Requesting URL: {url}")
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logging.error(f"Request failed: {e}")
-        raise
-
-
-def get_latest_block() -> int:
-    """Fetch the latest Ethereum block number."""
-    url = urljoin(ETHERSCAN_BASE_URL, f'?module=proxy&action=eth_blockNumber&apikey={ETHERSCAN_API_KEY}')
-    data = make_request(url)
-    try:
-        block_number = int(data.get('result', '0'), 16)
-        logging.info(f"Latest block number: {block_number}")
-        return block_number
-    except (ValueError, KeyError) as e:
-        logging.error(f"Error parsing block number: {e}")
-        return 0
-
-
-def get_block_transactions(block_number: int) -> Set[str]:
-    """
-    Retrieve unique Ethereum addresses from transactions in a specific block.
-
-    Args:
-        block_number (int): Block number to query.
-
-    Returns:
-        Set[str]: Set of unique Ethereum addresses.
-    """
-    url = urljoin(ETHERSCAN_BASE_URL, f'?module=proxy&action=eth_getBlockByNumber&tag=0x{block_number:x}&boolean=true&apikey={ETHERSCAN_API_KEY}')
-    data = make_request(url)
-    transactions = data.get('result', {}).get('transactions', [])
-    addresses = {tx.get('from') for tx in transactions if tx.get('from')} | \
-                {tx.get('to') for tx in transactions if tx.get('to')}
-    logging.debug(f"Extracted {len(addresses)} addresses from block {block_number}.")
-    return addresses
-
-
-def get_nfts_for_address(address: str) -> Set[str]:
-    """
-    Fetch NFT contract addresses associated with a specific Ethereum address.
-
-    Args:
-        address (str): Ethereum address to query.
-
-    Returns:
-        Set[str]: Set of NFT contract addresses.
-    """
-    url = urljoin(ETHERSCAN_BASE_URL, f'?module=account&action=tokennfttx&address={address}&startblock=0&endblock=999999999&sort=asc&apikey={ETHERSCAN_API_KEY}')
-    data = make_request(url)
-    nft_addresses = {nft.get('contractAddress') for nft in data.get('result', []) if nft.get('contractAddress')}
-    logging.debug(f"{len(nft_addresses)} NFT contract addresses found for {address}.")
-    return nft_addresses
-
-
-def save_nft_addresses(nft_addresses: Set[str]) -> None:
-    """
-    Persist NFT contract addresses to a file.
-
-    Args:
-        nft_addresses (Set[str]): Set of NFT addresses to save.
-    """
-    if nft_addresses:
+async def fetch(session: aiohttp.ClientSession, url: str, retries: int = MAX_RETRIES) -> dict:
+    """Asynchronously fetch data from API with retries."""
+    for attempt in range(retries):
         try:
-            with open(OUTPUT_FILE, 'a') as file:
-                file.write('\n'.join(nft_addresses) + '\n')
-            logging.info(f"Saved {len(nft_addresses)} NFT addresses to {OUTPUT_FILE}.")
-        except IOError as e:
-            logging.error(f"File writing error: {e}")
-    else:
-        logging.info("No NFT addresses to save.")
+            async with session.get(url, timeout=REQUEST_TIMEOUT) as response:
+                response.raise_for_status()
+                return await response.json()
+        except aiohttp.ClientError as e:
+            logging.error(f"Request failed ({attempt + 1}/{retries}): {e}")
+            await asyncio.sleep(2 ** attempt)
+    return {}
 
+async def get_latest_block(session: aiohttp.ClientSession) -> int:
+    """Fetch the latest Ethereum block number."""
+    url = f"{ETHERSCAN_BASE_URL}?module=proxy&action=eth_blockNumber&apikey={ETHERSCAN_API_KEY}"
+    data = await fetch(session, url)
+    return int(data.get('result', '0'), 16) if 'result' in data else 0
 
-def process_block() -> None:
+async def get_block_transactions(session: aiohttp.ClientSession, block_number: int) -> Set[str]:
+    """Retrieve unique Ethereum addresses from transactions in a specific block."""
+    url = f"{ETHERSCAN_BASE_URL}?module=proxy&action=eth_getBlockByNumber&tag=0x{block_number:x}&boolean=true&apikey={ETHERSCAN_API_KEY}"
+    data = await fetch(session, url)
+    transactions = data.get('result', {}).get('transactions', [])
+    return {tx.get('from') for tx in transactions if tx.get('from')} | {tx.get('to') for tx in transactions if tx.get('to')}
+
+async def get_nfts_for_address(session: aiohttp.ClientSession, address: str) -> Set[str]:
+    """Fetch NFT contract addresses associated with a specific Ethereum address."""
+    url = f"{ETHERSCAN_BASE_URL}?module=account&action=tokennfttx&address={address}&startblock=0&endblock=999999999&sort=asc&apikey={ETHERSCAN_API_KEY}"
+    data = await fetch(session, url)
+    return {nft.get('contractAddress') for nft in data.get('result', []) if nft.get('contractAddress')}
+
+async def save_nft_addresses(nft_addresses: Set[str]) -> None:
+    """Persist NFT contract addresses to a file."""
+    if nft_addresses:
+        async with aiofiles.open(OUTPUT_FILE, 'a') as file:
+            await file.write('\n'.join(nft_addresses) + '\n')
+        logging.info(f"Saved {len(nft_addresses)} NFT addresses.")
+
+async def process_block(session: aiohttp.ClientSession):
     """Process the latest Ethereum block and extract NFT contract addresses."""
-    latest_block = get_latest_block()
+    latest_block = await get_latest_block(session)
     if latest_block == 0:
-        logging.error("Invalid block number. Skipping this iteration.")
+        logging.error("Invalid block number. Skipping.")
         return
-
+    
     logging.info(f"Processing block {latest_block}")
-    addresses = get_block_transactions(latest_block)
+    addresses = await get_block_transactions(session, latest_block)
     if not addresses:
         logging.info("No transactions found in this block.")
         return
 
     nft_addresses = set()
-    for address in addresses:
-        nft_addresses.update(get_nfts_for_address(address))
+    tasks = [get_nfts_for_address(session, address) for address in addresses]
+    results = await asyncio.gather(*tasks)
+    for result in results:
+        nft_addresses.update(result)
+    
+    await save_nft_addresses(nft_addresses)
 
-    save_nft_addresses(nft_addresses)
-
-
-def main() -> None:
+async def main():
     """Continuously fetch and process blocks for NFT contract addresses."""
-    while True:
-        try:
-            process_block()
-        except requests.RequestException as e:
-            logging.error(f"Network error: {e}")
-        except Exception as e:
-            logging.error(f"Unexpected error: {e}")
-        
-        logging.info(f"Sleeping for {SLEEP_INTERVAL} seconds...")
-        sleep(SLEEP_INTERVAL)
-
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                start_time = time()
+                await process_block(session)
+                elapsed_time = time() - start_time
+                sleep_time = max(SLEEP_INTERVAL - elapsed_time, 0)
+                logging.info(f"Sleeping for {sleep_time:.2f} seconds...")
+                await asyncio.sleep(sleep_time)
+            except Exception as e:
+                logging.error(f"Unexpected error: {e}")
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
