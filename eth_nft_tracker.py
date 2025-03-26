@@ -43,7 +43,7 @@ async def get_latest_block(session: aiohttp.ClientSession) -> int:
     """Fetch the latest Ethereum block number."""
     url = f"{ETHERSCAN_BASE_URL}?module=proxy&action=eth_blockNumber&apikey={ETHERSCAN_API_KEY}"
     data = await fetch(session, url)
-    return int(data.get('result', '0'), 16) if 'result' in data else 0
+    return int(data.get('result', '0'), 16) if data.get('result') else 0
 
 async def get_block_transactions(session: aiohttp.ClientSession, block_number: int) -> Set[str]:
     """Retrieve unique Ethereum addresses from transactions in a block."""
