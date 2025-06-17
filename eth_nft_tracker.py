@@ -4,19 +4,20 @@ import logging
 import sys
 import aiofiles
 import random
+from dataclasses import dataclass
 from time import time
 from typing import Set, Dict, Any, Optional
 
-# Configuration
+@dataclass(frozen=True)
 class Config:
-    API_KEY = 'YOUR_ETHERSCAN_API_KEY'
-    BASE_URL = 'https://api.etherscan.io/api'
-    SLEEP_INTERVAL = 60
-    OUTPUT_FILE = 'nft_addresses.txt'
-    REQUEST_TIMEOUT = 10
-    MAX_RETRIES = 5
-    CONCURRENT_REQUESTS = 10
-    LOG_LEVEL = logging.INFO
+    API_KEY: str = 'YOUR_ETHERSCAN_API_KEY'
+    BASE_URL: str = 'https://api.etherscan.io/api'
+    SLEEP_INTERVAL: int = 60
+    OUTPUT_FILE: str = 'nft_addresses.txt'
+    REQUEST_TIMEOUT: int = 10
+    MAX_RETRIES: int = 5
+    CONCURRENT_REQUESTS: int = 10
+    LOG_LEVEL: int = logging.INFO
 
 # Setup logging
 logging.basicConfig(
@@ -25,19 +26,16 @@ logging.basicConfig(
 )
 
 async def fetch(session: aiohttp.ClientSession, url: str, retries: int = Config.MAX_RETRIES) -> Dict[str, Any]:
-    """
-    Fetch JSON data from the given URL with retries and exponential backoff.
-    """
     for attempt in range(1, retries + 1):
         try:
             async with session.get(url, timeout=Config.REQUEST_TIMEOUT) as response:
                 response.raise_for_status()
                 return await response.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            delay = (2 ** (attempt - 1)) + random.uniform(0, 1)
-            logging.warning(f"Attempt {attempt}/{retries} failed for {url}: {e}. Retrying in {delay:.2f}s...")
+            delay = min(30, (2 ** attempt) + random.uniform(0, 1))
+            logging.warning(f"Fetch attempt {attempt}/{retries} failed: {e}. Retrying in {delay:.2f}s.")
             await asyncio.sleep(delay)
-    logging.error(f"Request failed after {retries} retries: {url}")
+    logging.error(f"Failed to fetch after {retries} attempts: {url}")
     return {}
 
 async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
@@ -56,61 +54,75 @@ async def get_nfts_for_address(session: aiohttp.ClientSession, address: str, sem
     async with semaphore:
         url = f"{Config.BASE_URL}?module=account&action=tokennfttx&address={address}&startblock=0&endblock=latest&sort=asc&apikey={Config.API_KEY}"
         data = await fetch(session, url)
-        return {tx['contractAddress'] for tx in data.get('result', []) if tx.get('contractAddress')}
+        return {tx.get('contractAddress') for tx in data.get('result', []) if tx.get('contractAddress')}
 
 async def save_nft_addresses(addresses: Set[str]) -> None:
-    """
-    Append unique NFT addresses to the output file.
-    """
-    if addresses:
-        async with aiofiles.open(Config.OUTPUT_FILE, 'a') as f:
-            await f.write('\n'.join(addresses) + '\n')
-        logging.info(f"Saved {len(addresses)} new NFT addresses.")
+    if not addresses:
+        return
+    async with aiofiles.open(Config.OUTPUT_FILE, 'a') as f:
+        await f.write('\n'.join(addresses) + '\n')
+    logging.info(f"Saved {len(addresses)} new NFT addresses.")
 
-async def process_block(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, seen_addresses: Set[str]) -> None:
+async def process_block(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    seen_addresses: Set[str],
+    seen_blocks: Set[int]
+) -> None:
     latest_block = await get_latest_block(session)
     if latest_block is None:
-        logging.error("Could not retrieve the latest block number.")
+        logging.error("Failed to retrieve the latest block.")
+        return
+    if latest_block in seen_blocks:
+        logging.info(f"Block #{latest_block} already processed. Skipping.")
         return
 
-    logging.info(f"Processing block #{latest_block}")
+    logging.info(f"Processing block #{latest_block}...")
     addresses = await get_block_transactions(session, latest_block)
     if not addresses:
-        logging.info(f"No transactions found in block #{latest_block}")
+        logging.info(f"No transactions found in block #{latest_block}.")
         return
 
-    logging.info(f"Found {len(addresses)} addresses. Fetching NFT data...")
-    tasks = [asyncio.create_task(get_nfts_for_address(session, addr, semaphore)) for addr in addresses]
+    logging.info(f"Found {len(addresses)} unique addresses.")
+    tasks = [get_nfts_for_address(session, addr, semaphore) for addr in addresses]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    nft_addresses = {contract for result in results if isinstance(result, set) for contract in result}
+    nft_addresses = {
+        contract
+        for result in results
+        if isinstance(result, set)
+        for contract in result
+    }
+
     new_addresses = nft_addresses - seen_addresses
     if new_addresses:
         await save_nft_addresses(new_addresses)
         seen_addresses.update(new_addresses)
+    seen_blocks.add(latest_block)
 
 async def main():
     semaphore = asyncio.Semaphore(Config.CONCURRENT_REQUESTS)
     seen_addresses: Set[str] = set()
+    seen_blocks: Set[int] = set()
 
     async with aiohttp.ClientSession() as session:
         while True:
             try:
                 start = time()
-                await process_block(session, semaphore, seen_addresses)
+                await process_block(session, semaphore, seen_addresses, seen_blocks)
                 elapsed = time() - start
                 sleep_time = max(0, Config.SLEEP_INTERVAL - elapsed)
-                logging.info(f"Sleeping for {sleep_time:.2f} seconds...")
+                logging.info(f"Sleeping for {sleep_time:.2f} seconds.")
                 await asyncio.sleep(sleep_time)
             except asyncio.CancelledError:
-                logging.info("Main loop cancelled. Exiting gracefully...")
+                logging.info("Cancellation received. Exiting.")
                 break
             except Exception as e:
-                logging.exception(f"Unexpected error occurred: {e}")
+                logging.exception(f"Unhandled exception: {e}")
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Received keyboard interrupt. Exiting...")
+        logging.info("Keyboard interrupt. Exiting.")
         sys.exit(0)
