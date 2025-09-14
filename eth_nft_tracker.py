@@ -6,28 +6,32 @@ import aiofiles
 import random
 from dataclasses import dataclass
 from time import time
-from typing import Set, Dict, Any, Optional
+from typing import Set, Dict, Any, Optional, Union
+
 
 @dataclass(frozen=True)
 class Config:
-    API_KEY: str = 'YOUR_ETHERSCAN_API_KEY'
-    BASE_URL: str = 'https://api.etherscan.io/api'
+    API_KEY: str = "YOUR_ETHERSCAN_API_KEY"
+    BASE_URL: str = "https://api.etherscan.io/api"
     SLEEP_INTERVAL: int = 60
-    OUTPUT_FILE: str = 'nft_addresses.txt'
+    OUTPUT_FILE: str = "nft_addresses.txt"
     REQUEST_TIMEOUT: int = 10
     MAX_RETRIES: int = 5
     CONCURRENT_REQUESTS: int = 10
     LOG_LEVEL: int = logging.INFO
+    MAX_BACKOFF: int = 30
 
 
 # Logging setup
 logging.basicConfig(
     level=Config.LOG_LEVEL,
-    format='%(asctime)s | %(levelname)s | %(message)s'
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 
-async def retry_request(session: aiohttp.ClientSession, url: str, retries: int) -> Optional[Dict[str, Any]]:
+async def retry_request(
+    session: aiohttp.ClientSession, url: str, retries: int
+) -> Optional[Dict[str, Any]]:
     """Perform GET request with retry and exponential backoff."""
     for attempt in range(1, retries + 1):
         try:
@@ -35,18 +39,22 @@ async def retry_request(session: aiohttp.ClientSession, url: str, retries: int) 
                 response.raise_for_status()
                 data = await response.json()
 
-                # Handle API-specific errors (like rate limit)
-                if data.get("status") == "0" and "rate limit" in str(data.get("result", "")).lower():
-                    delay = 5 + attempt * 2
-                    logging.warning(f"[Rate limit] Delaying {delay}s.")
-                    await asyncio.sleep(delay)
-                    continue
+                # Handle API-specific errors (rate limits, etc.)
+                if data.get("status") == "0":
+                    result = str(data.get("result", "")).lower()
+                    if "rate limit" in result:
+                        delay = 5 + attempt * 2
+                        logging.warning(f"[Rate limit] Delaying {delay}s.")
+                        await asyncio.sleep(delay)
+                        continue
 
                 return data
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            delay = min(30, (2 ** attempt) + random.random())
-            logging.warning(f"[Retry {attempt}/{retries}] Failed {url}: {e}. Retrying in {delay:.2f}s.")
+            delay = min(Config.MAX_BACKOFF, (2**attempt) + random.random())
+            logging.warning(
+                f"[Retry {attempt}/{retries}] Failed {url}: {e}. Retrying in {delay:.2f}s."
+            )
             await asyncio.sleep(delay)
 
     logging.error(f"[Final failure] Could not fetch URL: {url}")
@@ -55,33 +63,39 @@ async def retry_request(session: aiohttp.ClientSession, url: str, retries: int) 
 
 async def fetch(session: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
     """Fetch data with retry wrapper."""
-    data = await retry_request(session, url, Config.MAX_RETRIES)
-    return data or {}
+    return await retry_request(session, url, Config.MAX_RETRIES) or {}
 
 
 async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
     """Fetch the latest Ethereum block number."""
     url = f"{Config.BASE_URL}?module=proxy&action=eth_blockNumber&apikey={Config.API_KEY}"
     data = await fetch(session, url)
-    hex_block = data.get("result")
-    if hex_block:
-        return int(hex_block, 16)
-    logging.error("No 'result' in blockNumber response.")
-    return None
+    try:
+        return int(data["result"], 16)
+    except (KeyError, TypeError, ValueError):
+        logging.error("Invalid response when fetching latest block.")
+        return None
 
 
-async def get_block_transactions(session: aiohttp.ClientSession, block_number: int) -> Set[str]:
+async def get_block_transactions(
+    session: aiohttp.ClientSession, block_number: int
+) -> Set[str]:
     """Get unique addresses from all transactions in a block."""
     hex_block = f"0x{block_number:x}"
-    url = f"{Config.BASE_URL}?module=proxy&action=eth_getBlockByNumber&tag={hex_block}&boolean=true&apikey={Config.API_KEY}"
+    url = (
+        f"{Config.BASE_URL}?module=proxy&action=eth_getBlockByNumber"
+        f"&tag={hex_block}&boolean=true&apikey={Config.API_KEY}"
+    )
     data = await fetch(session, url)
     txs = data.get("result", {}).get("transactions", [])
     addresses = {tx.get("from") for tx in txs if tx.get("from")}
     addresses |= {tx.get("to") for tx in txs if tx.get("to")}
-    return addresses
+    return {addr for addr in addresses if addr}
 
 
-async def get_nfts_for_address(session: aiohttp.ClientSession, address: str, semaphore: asyncio.Semaphore) -> Set[str]:
+async def get_nfts_for_address(
+    session: aiohttp.ClientSession, address: str, semaphore: asyncio.Semaphore
+) -> Set[str]:
     """Get all NFT contract addresses for a given Ethereum address."""
     async with semaphore:
         url = (
@@ -89,10 +103,11 @@ async def get_nfts_for_address(session: aiohttp.ClientSession, address: str, sem
             f"&address={address}&startblock=0&endblock=latest&sort=asc&apikey={Config.API_KEY}"
         )
         data = await fetch(session, url)
-        if not isinstance(data.get("result"), list):
+        result = data.get("result")
+        if not isinstance(result, list):
             logging.warning(f"Invalid NFT data for {address}: {data.get('message')}")
             return set()
-        return {tx.get("contractAddress") for tx in data["result"] if tx.get("contractAddress")}
+        return {tx.get("contractAddress") for tx in result if tx.get("contractAddress")}
 
 
 async def save_nft_addresses(addresses: Set[str]) -> None:
@@ -118,12 +133,14 @@ async def process_latest_block(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
     seen_addresses: Set[str],
-    seen_blocks: Set[int]
+    seen_blocks: Set[int],
 ) -> None:
     """Process the latest block: extract addresses, fetch NFT contracts, save new ones."""
     latest_block = await get_latest_block(session)
-    if latest_block is None or latest_block in seen_blocks:
-        logging.info(f"Skipping block #{latest_block} (already processed or unavailable).")
+    if not latest_block or latest_block in seen_blocks:
+        logging.info(
+            f"Skipping block #{latest_block} (already processed or unavailable)."
+        )
         return
 
     logging.info(f"Fetching transactions from block #{latest_block}...")
@@ -136,11 +153,14 @@ async def process_latest_block(
     logging.info(f"Found {len(unique_addresses)} unique addresses.")
 
     tasks = [get_nfts_for_address(session, addr, semaphore) for addr in unique_addresses]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results: list[Union[Set[str], Exception]] = await asyncio.gather(
+        *tasks, return_exceptions=True
+    )
 
     nft_addresses = {
         contract
-        for res in results if isinstance(res, set)
+        for res in results
+        if isinstance(res, set)
         for contract in res
     }
 
