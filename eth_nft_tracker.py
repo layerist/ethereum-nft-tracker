@@ -6,7 +6,7 @@ import aiofiles
 import random
 from dataclasses import dataclass
 from time import time
-from typing import Set, Dict, Any, Optional, List
+from typing import Set, Dict, Any, Optional
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,7 @@ class Config:
     LOG_LEVEL: int = logging.INFO
     MAX_BACKOFF: int = 30
     SAVE_INTERVAL: int = 10  # Save every N blocks to reduce I/O overhead
+    MIN_BACKOFF: int = 1
 
 
 # Logging setup
@@ -31,9 +32,9 @@ logging.basicConfig(
 )
 
 
-async def retry_request(session: aiohttp.ClientSession, url: str, retries: int) -> Optional[Dict[str, Any]]:
-    """Perform GET request with retry, exponential backoff, and rate limit handling."""
-    for attempt in range(1, retries + 1):
+async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[Dict[str, Any]]:
+    """Perform GET request with retries, exponential backoff, and rate-limit handling."""
+    for attempt in range(1, Config.MAX_RETRIES + 1):
         try:
             async with session.get(url, timeout=Config.REQUEST_TIMEOUT) as response:
                 response.raise_for_status()
@@ -46,85 +47,80 @@ async def retry_request(session: aiohttp.ClientSession, url: str, retries: int) 
                         logging.warning(f"[Rate limit] Delaying {delay}s.")
                         await asyncio.sleep(delay)
                         continue
-
                 return data
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            delay = min(Config.MAX_BACKOFF, (2 ** attempt) + random.random())
-            logging.warning(f"[Retry {attempt}/{retries}] {e.__class__.__name__}: {e}. Retrying in {delay:.2f}s.")
+            delay = min(Config.MAX_BACKOFF, Config.MIN_BACKOFF * (2 ** attempt) + random.random())
+            logging.warning(f"[Retry {attempt}/{Config.MAX_RETRIES}] {e.__class__.__name__}: {e}. Retrying in {delay:.1f}s.")
             await asyncio.sleep(delay)
+        except Exception as e:
+            logging.error(f"Unexpected error fetching {url}: {e}")
+            return None
 
-    logging.error(f"[Final failure] Could not fetch URL: {url}")
+    logging.error(f"[Final failure] Could not fetch URL after {Config.MAX_RETRIES} retries: {url}")
     return None
-
-
-async def fetch(session: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
-    """Fetch data with retry wrapper."""
-    return await retry_request(session, url, Config.MAX_RETRIES) or {}
 
 
 async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
     """Fetch the latest Ethereum block number."""
     url = f"{Config.BASE_URL}?module=proxy&action=eth_blockNumber&apikey={Config.API_KEY}"
-    data = await fetch(session, url)
+    data = await fetch_json(session, url)
     try:
         return int(data["result"], 16)
-    except (KeyError, TypeError, ValueError):
-        logging.error("Invalid response when fetching latest block.")
+    except Exception:
+        logging.error(f"Invalid response from latest block API: {data}")
         return None
 
 
 async def get_block_transactions(session: aiohttp.ClientSession, block_number: int) -> Set[str]:
-    """Get unique Ethereum addresses from all transactions in a block."""
+    """Extract unique Ethereum addresses from a given block."""
     hex_block = f"0x{block_number:x}"
     url = (
         f"{Config.BASE_URL}?module=proxy&action=eth_getBlockByNumber"
         f"&tag={hex_block}&boolean=true&apikey={Config.API_KEY}"
     )
-    data = await fetch(session, url)
-    txs = data.get("result", {}).get("transactions", [])
-    return {
-        addr
-        for tx in txs
-        for addr in (tx.get("from"), tx.get("to"))
-        if addr
-    }
+    data = await fetch_json(session, url)
+    if not data or "result" not in data:
+        logging.warning(f"No data for block #{block_number}")
+        return set()
+
+    txs = data["result"].get("transactions", [])
+    return {addr for tx in txs for addr in (tx.get("from"), tx.get("to")) if addr}
 
 
 async def get_nfts_for_address(session: aiohttp.ClientSession, address: str, semaphore: asyncio.Semaphore) -> Set[str]:
-    """Fetch all NFT contract addresses associated with a given address."""
+    """Fetch all NFT contract addresses for a given wallet."""
     async with semaphore:
         url = (
             f"{Config.BASE_URL}?module=account&action=tokennfttx"
             f"&address={address}&startblock=0&endblock=latest&sort=asc&apikey={Config.API_KEY}"
         )
-        data = await fetch(session, url)
-        result = data.get("result")
-        if not isinstance(result, list):
-            msg = data.get("message", "Unknown")
-            logging.warning(f"Invalid NFT data for {address}: {msg}")
+        data = await fetch_json(session, url)
+        if not data or not isinstance(data.get("result"), list):
+            msg = data.get("message", "Unknown error")
+            logging.debug(f"No NFT data for {address}: {msg}")
             return set()
 
-        return {tx["contractAddress"] for tx in result if "contractAddress" in tx}
-
-
-async def save_nft_addresses(addresses: Set[str]) -> None:
-    """Append NFT contract addresses to file."""
-    if not addresses:
-        return
-    async with aiofiles.open(Config.OUTPUT_FILE, "a") as file:
-        await file.write("\n".join(addresses) + "\n")
-    logging.info(f"Saved {len(addresses)} new NFT contract addresses.")
+        return {tx["contractAddress"] for tx in data["result"] if "contractAddress" in tx}
 
 
 async def load_seen_addresses() -> Set[str]:
-    """Load NFT addresses already stored on disk."""
+    """Load NFT addresses that are already saved."""
     try:
-        async with aiofiles.open(Config.OUTPUT_FILE, "r") as file:
-            lines = await file.readlines()
+        async with aiofiles.open(Config.OUTPUT_FILE, "r") as f:
+            lines = await f.readlines()
         return {line.strip() for line in lines if line.strip()}
     except FileNotFoundError:
         return set()
+
+
+async def save_nft_addresses(addresses: Set[str]) -> None:
+    """Append new NFT contract addresses to disk."""
+    if not addresses:
+        return
+    async with aiofiles.open(Config.OUTPUT_FILE, "a") as f:
+        await f.write("\n".join(addresses) + "\n")
+    logging.info(f"Saved {len(addresses)} new NFT addresses.")
 
 
 async def process_block(
@@ -133,16 +129,13 @@ async def process_block(
     semaphore: asyncio.Semaphore,
     seen_addresses: Set[str],
 ) -> Set[str]:
-    """Process a single block and return new NFT contract addresses."""
+    """Process a single block: get transactions, extract unique addresses, then fetch NFTs."""
     logging.info(f"Processing block #{block_number}...")
-    unique_addresses = await get_block_transactions(session, block_number)
-
-    if not unique_addresses:
-        logging.info(f"No transactions in block #{block_number}.")
+    addresses = await get_block_transactions(session, block_number)
+    if not addresses:
         return set()
 
-    logging.info(f"Found {len(unique_addresses)} unique addresses in block #{block_number}.")
-    tasks = [get_nfts_for_address(session, addr, semaphore) for addr in unique_addresses]
+    tasks = [get_nfts_for_address(session, addr, semaphore) for addr in addresses]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     nft_addresses = {
@@ -162,9 +155,9 @@ async def main() -> None:
     seen_blocks: Set[int] = set()
     processed_count = 0
 
-    logging.info(f"Loaded {len(seen_addresses)} previously saved NFT addresses.")
+    logging.info(f"Loaded {len(seen_addresses)} NFT addresses from disk.")
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(raise_for_status=False) as session:
         while True:
             try:
                 latest_block = await get_latest_block(session)
@@ -173,7 +166,7 @@ async def main() -> None:
                     continue
 
                 if latest_block in seen_blocks:
-                    logging.debug(f"Block #{latest_block} already processed. Skipping.")
+                    logging.debug(f"Block #{latest_block} already processed. Sleeping...")
                     await asyncio.sleep(Config.SLEEP_INTERVAL)
                     continue
 
@@ -189,17 +182,17 @@ async def main() -> None:
 
                 elapsed = time() - start
                 sleep_time = max(0, Config.SLEEP_INTERVAL - elapsed)
-                logging.info(f"Sleeping {sleep_time:.2f}s before next block check.")
+                logging.info(f"Sleeping {sleep_time:.1f}s before next check...")
                 await asyncio.sleep(sleep_time)
 
                 if processed_count % Config.SAVE_INTERVAL == 0:
                     await save_nft_addresses(seen_addresses)
 
             except asyncio.CancelledError:
-                logging.info("Script cancelled by user.")
+                logging.info("Task cancelled. Exiting.")
                 break
             except Exception as e:
-                logging.exception(f"Unhandled error: {e}")
+                logging.exception(f"Unhandled exception: {e}")
                 await asyncio.sleep(5)
 
 
