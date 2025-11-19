@@ -15,13 +15,14 @@ class Config:
     BASE_URL: str = "https://api.etherscan.io/api"
     SLEEP_INTERVAL: int = 60
     OUTPUT_FILE: str = "nft_addresses.txt"
-    REQUEST_TIMEOUT: int = 10
+    REQUEST_TIMEOUT: int = 12
     MAX_RETRIES: int = 5
     CONCURRENT_REQUESTS: int = 10
     LOG_LEVEL: int = logging.INFO
     MAX_BACKOFF: int = 30
-    SAVE_INTERVAL: int = 10  # Save every N blocks to reduce I/O overhead
+    SAVE_INTERVAL: int = 5
     MIN_BACKOFF: int = 1
+    GLOBAL_RPS: int = 4  # max global requests per second for safety
 
 
 # Logging setup
@@ -31,33 +32,43 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
+# global rate limiter
+rate_semaphore = asyncio.Semaphore(Config.GLOBAL_RPS)
+
+
+async def rate_limited():
+    """Limit total requests per second globally."""
+    async with rate_semaphore:
+        await asyncio.sleep(1 / Config.GLOBAL_RPS)
+
 
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[Dict[str, Any]]:
     """Perform GET request with retries, exponential backoff, and rate-limit handling."""
     for attempt in range(1, Config.MAX_RETRIES + 1):
         try:
+            await rate_limited()
+
             async with session.get(url, timeout=Config.REQUEST_TIMEOUT) as response:
                 response.raise_for_status()
                 data = await response.json()
 
+                # detect etherscan rate limit
                 if data.get("status") == "0":
                     result_text = str(data.get("result", "")).lower()
                     if "rate limit" in result_text:
-                        delay = 5 + attempt * 2
+                        delay = min(Config.MAX_BACKOFF, 5 + attempt * 2)
                         logging.warning(f"[Rate limit] Delaying {delay}s.")
                         await asyncio.sleep(delay)
                         continue
+
                 return data
 
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             delay = min(Config.MAX_BACKOFF, Config.MIN_BACKOFF * (2 ** attempt) + random.random())
-            logging.warning(f"[Retry {attempt}/{Config.MAX_RETRIES}] {e.__class__.__name__}: {e}. Retrying in {delay:.1f}s.")
+            logging.warning(f"[Retry {attempt}/{Config.MAX_RETRIES}] {e}. Retrying in {delay:.1f}s.")
             await asyncio.sleep(delay)
-        except Exception as e:
-            logging.error(f"Unexpected error fetching {url}: {e}")
-            return None
 
-    logging.error(f"[Final failure] Could not fetch URL after {Config.MAX_RETRIES} retries: {url}")
+    logging.error(f"[Final failure] Could not fetch URL: {url}")
     return None
 
 
@@ -88,8 +99,15 @@ async def get_block_transactions(session: aiohttp.ClientSession, block_number: i
     return {addr for tx in txs for addr in (tx.get("from"), tx.get("to")) if addr}
 
 
+# cache to skip addresses that have no NFTs (avoids useless queries)
+empty_wallet_cache: Set[str] = set()
+
+
 async def get_nfts_for_address(session: aiohttp.ClientSession, address: str, semaphore: asyncio.Semaphore) -> Set[str]:
     """Fetch all NFT contract addresses for a given wallet."""
+    if address in empty_wallet_cache:
+        return set()
+
     async with semaphore:
         url = (
             f"{Config.BASE_URL}?module=account&action=tokennfttx"
@@ -97,15 +115,17 @@ async def get_nfts_for_address(session: aiohttp.ClientSession, address: str, sem
         )
         data = await fetch_json(session, url)
         if not data or not isinstance(data.get("result"), list):
-            msg = data.get("message", "Unknown error")
-            logging.debug(f"No NFT data for {address}: {msg}")
+            empty_wallet_cache.add(address)
             return set()
 
-        return {tx["contractAddress"] for tx in data["result"] if "contractAddress" in tx}
+        result = {tx["contractAddress"] for tx in data["result"] if "contractAddress" in tx}
+        if not result:
+            empty_wallet_cache.add(address)
+
+        return result
 
 
 async def load_seen_addresses() -> Set[str]:
-    """Load NFT addresses that are already saved."""
     try:
         async with aiofiles.open(Config.OUTPUT_FILE, "r") as f:
             lines = await f.readlines()
@@ -115,7 +135,6 @@ async def load_seen_addresses() -> Set[str]:
 
 
 async def save_nft_addresses(addresses: Set[str]) -> None:
-    """Append new NFT contract addresses to disk."""
     if not addresses:
         return
     async with aiofiles.open(Config.OUTPUT_FILE, "a") as f:
@@ -129,24 +148,20 @@ async def process_block(
     semaphore: asyncio.Semaphore,
     seen_addresses: Set[str],
 ) -> Set[str]:
-    """Process a single block: get transactions, extract unique addresses, then fetch NFTs."""
     logging.info(f"Processing block #{block_number}...")
     addresses = await get_block_transactions(session, block_number)
     if not addresses:
         return set()
 
+    # remove addresses already checked with zero results
+    addresses = addresses - empty_wallet_cache
+
     tasks = [get_nfts_for_address(session, addr, semaphore) for addr in addresses]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    nft_addresses = {
-        contract
-        for res in results
-        if isinstance(res, set)
-        for contract in res
-    }
+    nft_addresses = {c for res in results if isinstance(res, set) for c in res}
 
-    new_contracts = nft_addresses - seen_addresses
-    return new_contracts
+    return nft_addresses - seen_addresses
 
 
 async def main() -> None:
@@ -155,10 +170,20 @@ async def main() -> None:
     seen_blocks: Set[int] = set()
     processed_count = 0
 
-    logging.info(f"Loaded {len(seen_addresses)} NFT addresses from disk.")
+    logging.info(f"Loaded {len(seen_addresses)} NFT addresses.")
+
+    # graceful shutdown support
+    stop_event = asyncio.Event()
+
+    def handle_stop(*_):
+        stop_event.set()
+
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(getattr(signal, "SIGINT"), handle_stop)
+    loop.add_signal_handler(getattr(signal, "SIGTERM"), handle_stop)
 
     async with aiohttp.ClientSession(raise_for_status=False) as session:
-        while True:
+        while not stop_event.is_set():
             try:
                 latest_block = await get_latest_block(session)
                 if not latest_block:
@@ -166,7 +191,6 @@ async def main() -> None:
                     continue
 
                 if latest_block in seen_blocks:
-                    logging.debug(f"Block #{latest_block} already processed. Sleeping...")
                     await asyncio.sleep(Config.SLEEP_INTERVAL)
                     continue
 
@@ -181,24 +205,22 @@ async def main() -> None:
                 processed_count += 1
 
                 elapsed = time() - start
-                sleep_time = max(0, Config.SLEEP_INTERVAL - elapsed)
-                logging.info(f"Sleeping {sleep_time:.1f}s before next check...")
-                await asyncio.sleep(sleep_time)
+                await asyncio.sleep(max(0, Config.SLEEP_INTERVAL - elapsed))
 
                 if processed_count % Config.SAVE_INTERVAL == 0:
+                    # safety save (idempotent)
                     await save_nft_addresses(seen_addresses)
 
-            except asyncio.CancelledError:
-                logging.info("Task cancelled. Exiting.")
-                break
             except Exception as e:
                 logging.exception(f"Unhandled exception: {e}")
                 await asyncio.sleep(5)
+
+    logging.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Interrupted by user. Exiting.")
+        logging.info("Interrupted by user.")
         sys.exit(0)
