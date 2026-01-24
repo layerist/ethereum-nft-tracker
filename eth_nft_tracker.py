@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Set, Dict, Any, Optional
 from collections import OrderedDict
+from urllib.parse import urlencode
 
 
 # ============================================================
@@ -47,6 +48,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -72,16 +74,16 @@ class TokenBucket:
             if self.tokens < 1:
                 wait = (1 - self.tokens) / self.rate
                 await asyncio.sleep(wait)
-                self.tokens = 0
+                self.tokens = 0.0
 
-            self.tokens -= 1
+            self.tokens -= 1.0
 
 
-bucket = TokenBucket(Config.GLOBAL_RPS, Config.TOKEN_BUCKET_SIZE)
+_bucket = TokenBucket(Config.GLOBAL_RPS, Config.TOKEN_BUCKET_SIZE)
 
 
 async def rate_limit() -> None:
-    await bucket.acquire()
+    await _bucket.acquire()
 
 
 # ============================================================
@@ -89,26 +91,32 @@ async def rate_limit() -> None:
 # ============================================================
 
 def build_url(module: str, action: str, **params) -> str:
-    query = "&".join(f"{k}={v}" for k, v in params.items())
-    return f"{Config.BASE_URL}?module={module}&action={action}&{query}&apikey={Config.API_KEY}"
+    params.update({
+        "module": module,
+        "action": action,
+        "apikey": Config.API_KEY,
+    })
+    return f"{Config.BASE_URL}?{urlencode(params)}"
 
 
 async def fetch_json(
     session: aiohttp.ClientSession,
-    url: str
+    url: str,
 ) -> Optional[Dict[str, Any]]:
 
     for attempt in range(1, Config.MAX_RETRIES + 1):
         try:
             await rate_limit()
+
             async with session.get(url) as resp:
+                resp.raise_for_status()
                 data = await resp.json(content_type=None)
 
                 if isinstance(data, dict) and data.get("status") == "0":
                     msg = str(data.get("result", "")).lower()
                     if "rate limit" in msg:
                         delay = min(Config.MAX_BACKOFF, 3 + attempt * 2)
-                        logging.warning(f"[Rate limit] Sleeping {delay:.1f}s")
+                        logger.warning(f"Rate limit hit → sleeping {delay:.1f}s")
                         await asyncio.sleep(delay)
                         continue
 
@@ -117,12 +125,14 @@ async def fetch_json(
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             delay = min(
                 Config.MAX_BACKOFF,
-                Config.MIN_BACKOFF * (2 ** (attempt - 1)) + random.random()
+                Config.MIN_BACKOFF * (2 ** (attempt - 1)) + random.random(),
             )
-            logging.warning(f"[Retry {attempt}/{Config.MAX_RETRIES}] {e} → {delay:.1f}s")
+            logger.warning(
+                f"Retry {attempt}/{Config.MAX_RETRIES}: {e} → {delay:.1f}s"
+            )
             await asyncio.sleep(delay)
 
-    logging.error(f"[Failed] {url}")
+    logger.error(f"Request failed permanently: {url}")
     return None
 
 
@@ -135,31 +145,38 @@ async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
     try:
         return int(data["result"], 16)
     except Exception:
-        logging.error("Invalid blockNumber response")
+        logger.error("Invalid blockNumber response")
         return None
 
 
 async def get_block_addresses(
     session: aiohttp.ClientSession,
-    block_number: int
+    block_number: int,
 ) -> Set[str]:
 
-    tag = f"0x{block_number:x}"
     data = await fetch_json(
         session,
-        build_url("proxy", "eth_getBlockByNumber", tag=tag, boolean="true")
+        build_url(
+            "proxy",
+            "eth_getBlockByNumber",
+            tag=f"0x{block_number:x}",
+            boolean="true",
+        ),
     )
 
     if not data or "result" not in data:
         return set()
 
-    txs = data["result"].get("transactions", [])
-    return {
-        addr
-        for tx in txs
-        for addr in (tx.get("from"), tx.get("to"))
-        if addr
-    }
+    txs = data["result"].get("transactions") or []
+    out: Set[str] = set()
+
+    for tx in txs:
+        if tx.get("from"):
+            out.add(tx["from"])
+        if tx.get("to"):
+            out.add(tx["to"])
+
+    return out
 
 
 # ============================================================
@@ -187,7 +204,7 @@ empty_wallets = EmptyWalletCache(Config.EMPTY_WALLET_CACHE_SIZE)
 async def get_nfts_for_address(
     session: aiohttp.ClientSession,
     address: str,
-    sem: asyncio.Semaphore
+    sem: asyncio.Semaphore,
 ) -> Set[str]:
 
     if address in empty_wallets:
@@ -206,13 +223,14 @@ async def get_nfts_for_address(
             ),
         )
 
-    if not data or not isinstance(data.get("result"), list):
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, list):
         empty_wallets.add(address)
         return set()
 
     contracts = {
-        tx["contractAddress"]
-        for tx in data["result"]
+        tx.get("contractAddress")
+        for tx in result
         if tx.get("contractAddress")
     }
 
@@ -237,9 +255,11 @@ async def load_seen() -> Set[str]:
 async def append_new(addresses: Set[str]) -> None:
     if not addresses:
         return
+
     async with aiofiles.open(Config.OUTPUT_FILE, "a") as f:
         await f.write("\n".join(addresses) + "\n")
-    logging.info(f"Saved {len(addresses)} NFT contracts")
+
+    logger.info(f"Saved {len(addresses)} NFT contracts")
 
 
 # ============================================================
@@ -253,21 +273,20 @@ async def process_block(
     seen: Set[str],
 ) -> Set[str]:
 
-    logging.info(f"Processing block #{block}")
+    logger.info(f"Processing block #{block}")
     addresses = await get_block_addresses(session, block)
-    addresses -= empty_wallets.data.keys()
+    addresses.difference_update(empty_wallets.data.keys())
 
     tasks = [
         get_nfts_for_address(session, addr, sem)
         for addr in addresses
     ]
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    found = {
-        c for r in results
-        if isinstance(r, set)
-        for c in r
-    }
+    found: Set[str] = set()
+
+    for result in await asyncio.gather(*tasks, return_exceptions=True):
+        if isinstance(result, set):
+            found.update(result)
 
     return found - seen
 
@@ -283,19 +302,20 @@ async def main() -> None:
 
     stop = asyncio.Event()
 
-    def shutdown(*_):
-        logging.info("Shutdown signal received")
+    def shutdown() -> None:
+        logger.info("Shutdown signal received")
         stop.set()
 
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, shutdown)
-    loop.add_signal_handler(signal.SIGTERM, shutdown)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, shutdown)
 
     timeout = aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while not stop.is_set():
             latest = await get_latest_block(session)
+
             if not latest or latest in seen_blocks:
                 await asyncio.sleep(Config.BLOCK_POLL_INTERVAL)
                 continue
@@ -308,7 +328,7 @@ async def main() -> None:
             seen_blocks.add(latest)
             await asyncio.sleep(Config.BLOCK_POLL_INTERVAL)
 
-    logging.info("Shutdown complete")
+    logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
