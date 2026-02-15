@@ -1,10 +1,10 @@
-import aiohttp
 import asyncio
-import logging
-import sys
+import aiohttp
 import aiofiles
-import random
+import logging
 import signal
+import sys
+import random
 from dataclasses import dataclass
 from time import monotonic
 from typing import Set, Dict, Any, Optional
@@ -48,11 +48,11 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("nft-scanner")
 
 
 # ============================================================
-# Rate Limiter (Token Bucket)
+# Token Bucket Rate Limiter
 # ============================================================
 
 class TokenBucket:
@@ -60,23 +60,24 @@ class TokenBucket:
         self.rate = rate
         self.capacity = capacity
         self.tokens = float(capacity)
-        self.last = monotonic()
+        self.last_refill = monotonic()
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
         async with self._lock:
             now = monotonic()
-            elapsed = now - self.last
-            self.last = now
+            elapsed = now - self.last_refill
+            self.last_refill = now
 
+            # Refill tokens
             self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
 
             if self.tokens < 1:
-                wait = (1 - self.tokens) / self.rate
-                await asyncio.sleep(wait)
-                self.tokens = 0.0
+                sleep_time = (1 - self.tokens) / self.rate
+                await asyncio.sleep(sleep_time)
+                self.tokens = 0
 
-            self.tokens -= 1.0
+            self.tokens -= 1
 
 
 _bucket = TokenBucket(Config.GLOBAL_RPS, Config.TOKEN_BUCKET_SIZE)
@@ -87,10 +88,10 @@ async def rate_limit() -> None:
 
 
 # ============================================================
-# HTTP helpers
+# HTTP Helpers
 # ============================================================
 
-def build_url(module: str, action: str, **params) -> str:
+def build_url(module: str, action: str, **params: Any) -> str:
     params.update({
         "module": module,
         "action": action,
@@ -112,27 +113,31 @@ async def fetch_json(
                 resp.raise_for_status()
                 data = await resp.json(content_type=None)
 
-                if isinstance(data, dict) and data.get("status") == "0":
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid JSON response")
+
+                # Etherscan explicit rate-limit message
+                if data.get("status") == "0":
                     msg = str(data.get("result", "")).lower()
                     if "rate limit" in msg:
-                        delay = min(Config.MAX_BACKOFF, 3 + attempt * 2)
-                        logger.warning(f"Rate limit hit → sleeping {delay:.1f}s")
+                        delay = min(Config.MAX_BACKOFF, 2 ** attempt)
+                        logger.warning(f"API rate limit hit → sleeping {delay:.1f}s")
                         await asyncio.sleep(delay)
                         continue
 
                 return data
 
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
             delay = min(
                 Config.MAX_BACKOFF,
                 Config.MIN_BACKOFF * (2 ** (attempt - 1)) + random.random(),
             )
             logger.warning(
-                f"Retry {attempt}/{Config.MAX_RETRIES}: {e} → {delay:.1f}s"
+                f"Retry {attempt}/{Config.MAX_RETRIES} → {e} | sleeping {delay:.1f}s"
             )
             await asyncio.sleep(delay)
 
-    logger.error(f"Request failed permanently: {url}")
+    logger.error(f"Permanent failure: {url}")
     return None
 
 
@@ -142,10 +147,13 @@ async def fetch_json(
 
 async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
     data = await fetch_json(session, build_url("proxy", "eth_blockNumber"))
+    if not data:
+        return None
+
     try:
         return int(data["result"], 16)
-    except Exception:
-        logger.error("Invalid blockNumber response")
+    except (KeyError, TypeError, ValueError):
+        logger.error("Invalid eth_blockNumber response")
         return None
 
 
@@ -168,19 +176,20 @@ async def get_block_addresses(
         return set()
 
     txs = data["result"].get("transactions") or []
-    out: Set[str] = set()
+    addresses: Set[str] = set()
 
     for tx in txs:
-        if tx.get("from"):
-            out.add(tx["from"])
-        if tx.get("to"):
-            out.add(tx["to"])
+        if isinstance(tx, dict):
+            if tx.get("from"):
+                addresses.add(tx["from"])
+            if tx.get("to"):
+                addresses.add(tx["to"])
 
-    return out
+    return addresses
 
 
 # ============================================================
-# Empty wallet LRU cache
+# Empty Wallet LRU Cache
 # ============================================================
 
 class EmptyWalletCache:
@@ -188,12 +197,12 @@ class EmptyWalletCache:
         self.max_size = max_size
         self.data: OrderedDict[str, None] = OrderedDict()
 
-    def __contains__(self, addr: str) -> bool:
-        return addr in self.data
+    def __contains__(self, address: str) -> bool:
+        return address in self.data
 
-    def add(self, addr: str) -> None:
-        self.data[addr] = None
-        self.data.move_to_end(addr)
+    def add(self, address: str) -> None:
+        self.data[address] = None
+        self.data.move_to_end(address)
         if len(self.data) > self.max_size:
             self.data.popitem(last=False)
 
@@ -231,7 +240,7 @@ async def get_nfts_for_address(
     contracts = {
         tx.get("contractAddress")
         for tx in result
-        if tx.get("contractAddress")
+        if isinstance(tx, dict) and tx.get("contractAddress")
     }
 
     if not contracts:
@@ -247,7 +256,7 @@ async def get_nfts_for_address(
 async def load_seen() -> Set[str]:
     try:
         async with aiofiles.open(Config.OUTPUT_FILE, "r") as f:
-            return {line.strip() for line in await f.readlines() if line.strip()}
+            return {line.strip() for line in await f if line.strip()}
     except FileNotFoundError:
         return set()
 
@@ -259,11 +268,11 @@ async def append_new(addresses: Set[str]) -> None:
     async with aiofiles.open(Config.OUTPUT_FILE, "a") as f:
         await f.write("\n".join(addresses) + "\n")
 
-    logger.info(f"Saved {len(addresses)} NFT contracts")
+    logger.info(f"Saved {len(addresses)} new NFT contracts")
 
 
 # ============================================================
-# Block processor
+# Block Processing
 # ============================================================
 
 async def process_block(
@@ -274,17 +283,23 @@ async def process_block(
 ) -> Set[str]:
 
     logger.info(f"Processing block #{block}")
+
     addresses = await get_block_addresses(session, block)
-    addresses.difference_update(empty_wallets.data.keys())
+    addresses = {
+        addr for addr in addresses
+        if addr and addr not in empty_wallets
+    }
 
     tasks = [
         get_nfts_for_address(session, addr, sem)
         for addr in addresses
     ]
 
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     found: Set[str] = set()
 
-    for result in await asyncio.gather(*tasks, return_exceptions=True):
+    for result in results:
         if isinstance(result, set):
             found.update(result)
 
@@ -297,35 +312,51 @@ async def process_block(
 
 async def main() -> None:
     sem = asyncio.Semaphore(Config.CONCURRENT_REQUESTS)
-    seen = await load_seen()
-    seen_blocks: Set[int] = set()
+    seen_contracts = await load_seen()
+    processed_blocks: Set[int] = set()
 
-    stop = asyncio.Event()
+    stop_event = asyncio.Event()
 
     def shutdown() -> None:
         logger.info("Shutdown signal received")
-        stop.set()
+        stop_event.set()
 
     loop = asyncio.get_running_loop()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown)
+        try:
+            loop.add_signal_handler(sig, shutdown)
+        except NotImplementedError:
+            pass  # Windows fallback
 
     timeout = aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT)
+    connector = aiohttp.TCPConnector(limit=Config.CONCURRENT_REQUESTS)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while not stop.is_set():
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+    ) as session:
+
+        while not stop_event.is_set():
+
             latest = await get_latest_block(session)
 
-            if not latest or latest in seen_blocks:
+            if not latest or latest in processed_blocks:
                 await asyncio.sleep(Config.BLOCK_POLL_INTERVAL)
                 continue
 
-            new = await process_block(session, latest, sem, seen)
-            if new:
-                seen.update(new)
-                await append_new(new)
+            new_contracts = await process_block(
+                session,
+                latest,
+                sem,
+                seen_contracts,
+            )
 
-            seen_blocks.add(latest)
+            if new_contracts:
+                seen_contracts.update(new_contracts)
+                await append_new(new_contracts)
+
+            processed_blocks.add(latest)
             await asyncio.sleep(Config.BLOCK_POLL_INTERVAL)
 
     logger.info("Shutdown complete")
