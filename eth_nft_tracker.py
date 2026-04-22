@@ -35,10 +35,10 @@ class Config:
 
     EMPTY_WALLET_CACHE_SIZE: int = 100_000
 
-    BLOCK_POLL_INTERVAL: int = 8
+    BLOCK_POLL_INTERVAL: int = 6
 
     ADDRESS_QUEUE_SIZE: int = 50_000
-    WRITE_BUFFER_SIZE: int = 200
+    WRITE_BUFFER_SIZE: int = 300
 
     LOG_LEVEL: int = logging.INFO
 
@@ -57,7 +57,7 @@ logger = logging.getLogger("nft-scanner")
 
 
 # ============================================================
-# Token Bucket Rate Limiter
+# Token Bucket
 # ============================================================
 
 class TokenBucket:
@@ -92,10 +92,6 @@ class TokenBucket:
 bucket = TokenBucket(Config.GLOBAL_RPS, Config.TOKEN_BUCKET_SIZE)
 
 
-async def rate_limit():
-    await bucket.acquire()
-
-
 # ============================================================
 # HTTP Helpers
 # ============================================================
@@ -112,7 +108,7 @@ def build_url(module: str, action: str, **params: Any) -> str:
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[Dict[str, Any]]:
     for attempt in range(1, Config.MAX_RETRIES + 1):
         try:
-            await rate_limit()
+            await bucket.acquire()
 
             async with session.get(
                 url,
@@ -145,15 +141,14 @@ async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[Dict[
             logger.warning(f"[retry {attempt}] {e} → {delay:.2f}s")
             await asyncio.sleep(delay)
 
-    logger.error(f"FAILED: {url}")
     return None
 
 
 # ============================================================
-# Etherscan API
+# API
 # ============================================================
 
-async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
+async def get_latest_block(session):
     data = await fetch_json(session, build_url("proxy", "eth_blockNumber"))
     try:
         return int(data["result"], 16) if data else None
@@ -161,7 +156,7 @@ async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
         return None
 
 
-async def get_block_addresses(session: aiohttp.ClientSession, block: int) -> Set[str]:
+async def get_block_addresses(session, block: int) -> Set[str]:
     data = await fetch_json(
         session,
         build_url("proxy", "eth_getBlockByNumber", tag=f"0x{block:x}", boolean="true")
@@ -182,19 +177,23 @@ async def get_block_addresses(session: aiohttp.ClientSession, block: int) -> Set
 
 
 # ============================================================
-# LRU Cache (faster)
+# LRU Cache (optimized)
 # ============================================================
 
 class LRUCache:
     def __init__(self, max_size: int):
-        self.max_size = max_size
         self.data = OrderedDict()
+        self.max_size = max_size
 
     def contains(self, key: str) -> bool:
-        return key in self.data
+        if key in self.data:
+            self.data.move_to_end(key)
+            return True
+        return False
 
     def add(self, key: str):
         self.data[key] = None
+        self.data.move_to_end(key)
         if len(self.data) > self.max_size:
             self.data.popitem(last=False)
 
@@ -241,7 +240,7 @@ async def fetch_nfts(session, address: str) -> Set[str]:
 
 
 # ============================================================
-# Persistence (buffered writer)
+# Writer (non-blocking flush)
 # ============================================================
 
 class AsyncWriter:
@@ -251,29 +250,41 @@ class AsyncWriter:
         self.lock = asyncio.Lock()
 
     async def add(self, items: Set[str]):
+        flush_now = False
+
         async with self.lock:
             self.buffer.update(items)
-
             if len(self.buffer) >= Config.WRITE_BUFFER_SIZE:
-                await self.flush()
+                data = self.buffer
+                self.buffer = set()
+                flush_now = True
+
+        if flush_now:
+            await self._write(data)
 
     async def flush(self):
-        if not self.buffer:
+        async with self.lock:
+            data = self.buffer
+            self.buffer = set()
+
+        if data:
+            await self._write(data)
+
+    async def _write(self, data: Set[str]):
+        async with aiofiles.open(self.path, "a") as f:
+            await f.write("\n".join(data) + "\n")
+        logger.info(f"Saved {len(data)} contracts")
+
+
+# ============================================================
+# Worker
+# ============================================================
+
+async def worker(queue, session, seen, writer, stop_event):
+    while True:
+        if stop_event.is_set() and queue.empty():
             return
 
-        async with aiofiles.open(self.path, "a") as f:
-            await f.write("\n".join(self.buffer) + "\n")
-
-        logger.info(f"Saved {len(self.buffer)} contracts")
-        self.buffer.clear()
-
-
-# ============================================================
-# Worker Pipeline
-# ============================================================
-
-async def worker(name, queue, session, seen, writer, stop_event):
-    while not stop_event.is_set():
         try:
             address = await asyncio.wait_for(queue.get(), timeout=1)
         except asyncio.TimeoutError:
@@ -312,17 +323,18 @@ async def main():
             pass
 
     connector = aiohttp.TCPConnector(limit=Config.CONCURRENT_REQUESTS)
-
     queue = asyncio.Queue(maxsize=Config.ADDRESS_QUEUE_SIZE)
+
     writer = AsyncWriter(Config.OUTPUT_FILE)
+
     seen: Set[str] = set()
+    queued_addresses: Set[str] = set()  # 🔥 prevents duplicates
 
     async with aiohttp.ClientSession(connector=connector) as session:
 
-        # workers
         workers = [
-            asyncio.create_task(worker(i, queue, session, seen, writer, stop_event))
-            for i in range(Config.CONCURRENT_REQUESTS)
+            asyncio.create_task(worker(queue, session, seen, writer, stop_event))
+            for _ in range(Config.CONCURRENT_REQUESTS)
         ]
 
         last_block = None
@@ -342,11 +354,15 @@ async def main():
                 addresses = await get_block_addresses(session, block)
 
                 for addr in addresses:
-                    if not empty_wallets.contains(addr):
-                        try:
-                            queue.put_nowait(addr)
-                        except asyncio.QueueFull:
-                            await queue.put(addr)
+                    if addr in queued_addresses or empty_wallets.contains(addr):
+                        continue
+
+                    queued_addresses.add(addr)
+
+                    try:
+                        queue.put_nowait(addr)
+                    except asyncio.QueueFull:
+                        await queue.put(addr)
 
                 last_block = block
 
@@ -362,7 +378,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
