@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-NFT Scanner v5 — reliable asynchronous Etherscan V2 scanner.
+NFT Scanner v6 — crash-safe asynchronous Etherscan V2 scanner.
 
 Scans confirmed Ethereum blocks, extracts transaction participants, requests
 recent ERC-721 transfers for those addresses and appends newly discovered NFT
 contract addresses to a text file.
 
-Reliability changes over v4:
-- Etherscan API V2 endpoint and explicit CHAIN_ID.
-- Request failure is never treated as an empty wallet.
-- A failed block is never checkpointed or silently skipped.
-- Exact in-flight address set: queued items cannot be evicted and duplicated.
-- Per-key cooldown honours Retry-After and separates rate-limit failures.
-- Explicit Etherscan envelope/error classification.
-- Atomic checkpoint with UTC timestamp and optional directory fsync.
-- Serialized append writer with flush + fsync before checkpoint advancement.
-- Graceful Windows/POSIX shutdown and fatal worker monitoring.
-- Stronger configuration validation and secret-safe logging.
+Reliability changes over v5:
+- Corrupt checkpoints are fatal instead of silently jumping to the current head.
+- Worker failure always wins over queue.join(), eliminating a checkpoint race.
+- Empty-wallet cache now expires, so an address can be rescanned after later NFT activity.
+- Checkpoint rename is followed by directory fsync on POSIX when FSYNC_WRITES=true.
+- Retry-After supports both seconds and HTTP-date form.
+- Shutdown always attempts to flush buffered contracts, even after a worker failure.
+- Optional multi-page ERC-721 history scan via NFT_TX_PAGES.
+- Stronger validation, stats and error messages while retaining Etherscan V2/CHAIN_ID.
+
 
 Required environment variable:
   ETHERSCAN_API_KEYS=key1,key2
@@ -29,6 +28,8 @@ Useful variables:
   WORKERS=20
   CONFIRMATIONS=3
   NFT_TX_OFFSET=100
+  NFT_TX_PAGES=1
+  EMPTY_WALLET_CACHE_TTL=3600
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any, Iterable, Mapping, Optional, TypeVar
@@ -134,8 +136,10 @@ class Config:
     max_blocks_per_batch: int = 3
     block_poll_interval: float = 3.0
     nft_tx_offset: int = 100
+    nft_tx_pages: int = 1
 
     empty_wallet_cache_size: int = 200_000
+    empty_wallet_cache_ttl: float = 3600.0
     write_buffer_size: int = 500
     stats_interval: float = 30.0
 
@@ -144,7 +148,7 @@ class Config:
     fsync_writes: bool = True
 
     log_level: str = "INFO"
-    user_agent: str = "NFTScanner/5.0 (+aiohttp; Etherscan-V2)"
+    user_agent: str = "NFTScanner/6.0 (+aiohttp; Etherscan-V2)"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -171,7 +175,9 @@ class Config:
             max_blocks_per_batch=env_int("MAX_BLOCKS_PER_BATCH", cls.max_blocks_per_batch),
             block_poll_interval=env_float("BLOCK_POLL_INTERVAL", cls.block_poll_interval),
             nft_tx_offset=env_int("NFT_TX_OFFSET", cls.nft_tx_offset),
+            nft_tx_pages=env_int("NFT_TX_PAGES", cls.nft_tx_pages),
             empty_wallet_cache_size=env_int("EMPTY_WALLET_CACHE_SIZE", cls.empty_wallet_cache_size),
+            empty_wallet_cache_ttl=env_float("EMPTY_WALLET_CACHE_TTL", cls.empty_wallet_cache_ttl),
             write_buffer_size=env_int("WRITE_BUFFER_SIZE", cls.write_buffer_size),
             stats_interval=env_float("STATS_INTERVAL", cls.stats_interval),
             api_key_cooldown_sec=env_float("API_KEY_COOLDOWN_SEC", cls.api_key_cooldown_sec),
@@ -197,6 +203,7 @@ class Config:
             "MAX_RETRIES": self.max_retries,
             "MAX_BLOCKS_PER_BATCH": self.max_blocks_per_batch,
             "NFT_TX_OFFSET": self.nft_tx_offset,
+            "NFT_TX_PAGES": self.nft_tx_pages,
             "WRITE_BUFFER_SIZE": self.write_buffer_size,
         }
         for name, value in positive_ints.items():
@@ -206,6 +213,8 @@ class Config:
             raise ValueError("NFT_TX_OFFSET must be <= 1000")
         if self.global_rps <= 0 or self.request_timeout <= 0 or self.connect_timeout <= 0:
             raise ValueError("RPS and timeouts must be > 0")
+        if self.empty_wallet_cache_size < 0 or self.empty_wallet_cache_ttl < 0:
+            raise ValueError("EMPTY_WALLET_CACHE_SIZE and EMPTY_WALLET_CACHE_TTL must be >= 0")
         if self.confirmations < 0 or self.start_block < 0:
             raise ValueError("CONFIRMATIONS and START_BLOCK must be >= 0")
         if self.min_backoff < 0 or self.max_backoff < self.min_backoff:
@@ -258,26 +267,51 @@ def _fsync_path_sync(path: Path) -> None:
         os.fsync(handle.fileno())
 
 
-class LRUSet:
-    def __init__(self, max_size: int):
+class ExpiringLRUSet:
+    """Bounded LRU set whose entries expire after ttl seconds."""
+
+    def __init__(self, max_size: int, ttl: float):
         self.max_size = max_size
-        self._data: OrderedDict[str, None] = OrderedDict()
+        self.ttl = ttl
+        self._data: OrderedDict[str, float] = OrderedDict()
 
     def __contains__(self, key: str) -> bool:
-        if key not in self._data:
+        if self.max_size <= 0 or self.ttl <= 0:
+            return False
+        expires_at = self._data.get(key)
+        if expires_at is None:
+            return False
+        now = monotonic()
+        if expires_at <= now:
+            self._data.pop(key, None)
             return False
         self._data.move_to_end(key)
         return True
 
     def add(self, key: str) -> None:
-        if self.max_size <= 0:
+        if self.max_size <= 0 or self.ttl <= 0:
             return
-        self._data[key] = None
+        now = monotonic()
+        self._data[key] = now + self.ttl
         self._data.move_to_end(key)
+        self._prune(now)
+
+    def _prune(self, now: Optional[float] = None) -> None:
+        if not self._data:
+            return
+        now = monotonic() if now is None else now
+
+        # Expired entries are not necessarily at the front because a membership
+        # hit moves an item to the end without extending its lifetime.
+        expired = [key for key, expires_at in self._data.items() if expires_at <= now]
+        for key in expired:
+            self._data.pop(key, None)
+
         while len(self._data) > self.max_size:
             self._data.popitem(last=False)
 
     def __len__(self) -> int:
+        self._prune()
         return len(self._data)
 
 
@@ -357,7 +391,7 @@ class Stats:
         logger: logging.Logger,
         queue: asyncio.Queue[str],
         in_flight: set[str],
-        empty_cache: LRUSet,
+        empty_cache: ExpiringLRUSet,
     ) -> None:
         while True:
             await asyncio.sleep(interval)
@@ -395,14 +429,22 @@ class Checkpoint:
                 raise ValueError("negative block")
             return value
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-            broken = self.path.with_suffix(self.path.suffix + ".broken")
-            self.logger.error("Invalid checkpoint %s: %s", self.path, exc)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            broken = self.path.with_name(f"{self.path.name}.broken.{stamp}")
+            self.logger.critical("Invalid checkpoint %s: %s", self.path, exc)
+            moved_to: Optional[Path] = None
             try:
                 os.replace(self.path, broken)
-                self.logger.error("Moved invalid checkpoint to %s", broken)
-            except OSError:
-                pass
-            return None
+                moved_to = broken
+                self.logger.critical("Moved invalid checkpoint to %s", broken)
+            except OSError as move_exc:
+                self.logger.critical("Could not preserve invalid checkpoint: %s", move_exc)
+            detail = f"; preserved as {moved_to}" if moved_to else ""
+            raise RuntimeError(
+                f"Checkpoint {self.path} is invalid{detail}. "
+                "Refusing to initialize at the current head because that could skip blocks. "
+                "Restore/fix the checkpoint, or delete it intentionally and set START_BLOCK."
+            ) from exc
 
     async def save(self, block: int) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,6 +460,23 @@ class Checkpoint:
         if self.fsync:
             await fsync_path(tmp)
         os.replace(tmp, self.path)
+        if self.fsync:
+            await fsync_directory(self.path.parent)
+
+
+async def fsync_directory(path: Path) -> None:
+    """Persist a directory entry update where the platform supports it."""
+    if os.name == "nt":
+        return
+    await asyncio.to_thread(_fsync_directory_sync, path)
+
+
+def _fsync_directory_sync(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class ContractWriter:
@@ -580,9 +639,18 @@ class EtherscanClient:
     def _retry_after(value: Optional[str]) -> Optional[float]:
         if not value:
             return None
+        value = value.strip()
         try:
             return max(0.1, float(value))
         except ValueError:
+            pass
+        try:
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = (when - datetime.now(timezone.utc)).total_seconds()
+            return max(0.1, seconds)
+        except (TypeError, ValueError, OverflowError):
             return None
 
     def _classify_envelope(self, data: Mapping[str, Any]) -> None:
@@ -648,27 +716,36 @@ class EtherscanClient:
         return addresses
 
     async def nft_contracts_for_address(self, address: str) -> set[str]:
-        data = await self.request(
-            "account",
-            "tokennfttx",
-            address=address,
-            page=1,
-            offset=self.config.nft_tx_offset,
-            sort="desc",
-        )
-        result = data.get("result")
-        if isinstance(result, str) and "no transactions found" in result.lower():
-            return set()
-        if not isinstance(result, list):
-            raise RetryableAPIError(f"Invalid tokennfttx result for {address}: {type(result).__name__}")
-
         contracts: set[str] = set()
-        for transfer in result:
-            if not isinstance(transfer, dict):
-                continue
-            contract = normalize_address(transfer.get("contractAddress"))
-            if contract:
-                contracts.add(contract)
+
+        for page in range(1, self.config.nft_tx_pages + 1):
+            data = await self.request(
+                "account",
+                "tokennfttx",
+                address=address,
+                page=page,
+                offset=self.config.nft_tx_offset,
+                sort="desc",
+            )
+            result = data.get("result")
+            if isinstance(result, str) and "no transactions found" in result.lower():
+                break
+            if not isinstance(result, list):
+                raise RetryableAPIError(
+                    f"Invalid tokennfttx result for {address}: {type(result).__name__}"
+                )
+
+            for transfer in result:
+                if not isinstance(transfer, dict):
+                    continue
+                contract = normalize_address(transfer.get("contractAddress"))
+                if contract:
+                    contracts.add(contract)
+
+            # A short page is the final page.
+            if len(result) < self.config.nft_tx_offset:
+                break
+
         return contracts
 
 
@@ -683,7 +760,7 @@ async def address_worker(
     client: EtherscanClient,
     seen_contracts: set[str],
     seen_lock: asyncio.Lock,
-    empty_wallets: LRUSet,
+    empty_wallets: ExpiringLRUSet,
     in_flight: set[str],
     writer: ContractWriter,
     stats: Stats,
@@ -723,22 +800,37 @@ async def address_worker(
 async def wait_for_queue_or_worker_failure(
     queue: asyncio.Queue[str], workers: list[asyncio.Task[None]]
 ) -> None:
+    """Wait for a drained queue, but never miss a worker that died concurrently."""
     join_task = asyncio.create_task(queue.join(), name="queue-join")
-    done, _ = await asyncio.wait([join_task, *workers], return_when=asyncio.FIRST_COMPLETED)
-    if join_task in done:
-        return
-    join_task.cancel()
-    await asyncio.gather(join_task, return_exceptions=True)
-    failed = next(task for task in done if task is not join_task)
-    exc = failed.exception()
-    raise RuntimeError(f"Address worker stopped unexpectedly: {exc!r}") from exc
+    try:
+        await asyncio.wait([join_task, *workers], return_when=asyncio.FIRST_COMPLETED)
+
+        # Inspect *all* workers after wake-up. queue.join() and a worker failure can
+        # become ready in the same loop turn; a completed worker must win.
+        stopped = [task for task in workers if task.done()]
+        if stopped:
+            task = stopped[0]
+            if task.cancelled():
+                raise RuntimeError(f"Address worker {task.get_name()} was cancelled unexpectedly")
+            exc = task.exception()
+            if exc is None:
+                raise RuntimeError(f"Address worker {task.get_name()} stopped unexpectedly")
+            raise RuntimeError(
+                f"Address worker {task.get_name()} stopped unexpectedly: {exc!r}"
+            ) from exc
+
+        await join_task
+    finally:
+        if not join_task.done():
+            join_task.cancel()
+        await asyncio.gather(join_task, return_exceptions=True)
 
 
 async def run(config: Config) -> None:
     config.validate()
     logger = setup_logging(config.log_level)
     logger.info(
-        "Starting NFT Scanner v5: chain=%d workers=%d rps=%.2f confirmations=%d keys=%d",
+        "Starting NFT Scanner v6: chain=%d workers=%d rps=%.2f confirmations=%d keys=%d",
         config.chain_id, config.workers, config.global_rps, config.confirmations, len(config.api_keys),
     )
 
@@ -758,7 +850,7 @@ async def run(config: Config) -> None:
 
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=config.address_queue_size)
     in_flight: set[str] = set()
-    empty_wallets = LRUSet(config.empty_wallet_cache_size)
+    empty_wallets = ExpiringLRUSet(config.empty_wallet_cache_size, config.empty_wallet_cache_ttl)
     seen_contracts = load_contracts((config.output_file, config.known_contracts_file), logger)
     seen_lock = asyncio.Lock()
     stats = Stats()
@@ -817,7 +909,7 @@ async def run(config: Config) -> None:
                 if last_processed is None:
                     last_processed = safe_head
                     await checkpoint.save(last_processed)
-                    logger.info("Initialized at safe head %d; historical blocks are not scanned", safe_head)
+                    logger.info("Initialized at safe head %d; historical blocks are not scanned (set START_BLOCK for history)", safe_head)
                     await asyncio.sleep(config.block_poll_interval)
                     continue
 
@@ -879,8 +971,16 @@ async def run(config: Config) -> None:
             stop_event.set()
             logger.info("Stopping producer; draining %d queued addresses", queue.qsize())
             try:
-                await wait_for_queue_or_worker_failure(queue, workers)
-                await writer.flush()
+                try:
+                    await wait_for_queue_or_worker_failure(queue, workers)
+                except Exception as exc:
+                    # Do not let a dead worker prevent already-discovered contracts
+                    # from being persisted. The uncheckpointed block/batch will replay.
+                    logger.error("Queue did not drain cleanly during shutdown: %s", exc)
+                try:
+                    await writer.flush()
+                except Exception as exc:
+                    logger.critical("Final contract flush failed: %s", exc, exc_info=True)
             finally:
                 stats_task.cancel()
                 for task in workers:
