@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-NFT Scanner v7 — crash-safe asynchronous Etherscan V2 scanner.
+NFT Scanner v8 — crash-safe asynchronous Etherscan V2 scanner.
 
 Scans confirmed blocks, extracts top-level transaction participants, requests
 recent ERC-721 transfers for those addresses, and appends newly discovered NFT
 contract addresses to a text file.
 
-Major changes over v6:
+Major changes over v7:
+- Checkpoint v3 binds state to CHAIN_ID, preventing accidental cross-chain resume.
+- Newly created append files fsync their parent directory when durability is enabled.
 - Fail-fast producer: queue.put() can no longer hang forever after a worker dies.
 - Per-key rate-limit rotation: a throttled API key is cooled down without forcing
   a global 30-second sleep when another key is available.
@@ -157,7 +159,7 @@ class Config:
     verify_checkpoint_hash: bool = True
 
     log_level: str = "INFO"
-    user_agent: str = "NFTScanner/7.0 (+aiohttp; Etherscan-V2)"
+    user_agent: str = "NFTScanner/8.0 (+aiohttp; Etherscan-V2)"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -572,18 +574,24 @@ def _atomic_json_write_sync(path: Path, payload: Mapping[str, Any], fsync: bool)
 
 def _append_lines_sync(path: Path, lines: list[str], fsync: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
     with path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write("\n".join(lines))
         handle.write("\n")
         handle.flush()
         if fsync:
             os.fsync(handle.fileno())
+    if fsync and not existed:
+        _fsync_directory_sync(path.parent)
 
 
 class Checkpoint:
-    def __init__(self, path: Path, fsync: bool, logger: logging.Logger):
+    def __init__(
+        self, path: Path, fsync: bool, chain_id: int, logger: logging.Logger
+    ):
         self.path = path
         self.fsync = fsync
+        self.chain_id = chain_id
         self.logger = logger
 
     def load(self) -> Optional[CheckpointState]:
@@ -597,8 +605,16 @@ class Checkpoint:
                 raise ValueError("checkpoint root must be an object")
 
             version = int(payload.get("version", 1))
-            if version not in {1, 2}:
+            if version not in {1, 2, 3}:
                 raise ValueError(f"unsupported checkpoint version {version}")
+
+            if version >= 3:
+                checkpoint_chain_id = int(payload["chain_id"])
+                if checkpoint_chain_id != self.chain_id:
+                    raise ValueError(
+                        f"checkpoint chain_id={checkpoint_chain_id} does not match "
+                        f"configured CHAIN_ID={self.chain_id}"
+                    )
 
             block = int(payload["last_processed_block"])
             if block < 0:
@@ -636,7 +652,8 @@ class Checkpoint:
 
     async def save(self, block: int, block_hash: Optional[str]) -> None:
         payload = {
-            "version": 2,
+            "version": 3,
+            "chain_id": self.chain_id,
             "last_processed_block": block,
             "last_processed_block_hash": block_hash,
             "saved_at_utc": utc_now_iso(),
@@ -1353,7 +1370,7 @@ async def run(config: Config) -> None:
     config.validate()
     logger = setup_logging(config.log_level)
     logger.info(
-        "Starting NFT Scanner v7: chain=%d workers=%d rps=%.2f "
+        "Starting NFT Scanner v8: chain=%d workers=%d rps=%.2f "
         "confirmations=%d keys=%d pages=%d",
         config.chain_id,
         config.workers,
@@ -1402,6 +1419,7 @@ async def run(config: Config) -> None:
     checkpoint = Checkpoint(
         config.checkpoint_file,
         config.fsync_writes,
+        config.chain_id,
         logger,
     )
     limiter = TokenBucket(
