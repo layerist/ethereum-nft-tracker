@@ -6,6 +6,14 @@ Scans confirmed blocks, extracts top-level transaction participants, requests
 recent ERC-721 transfers for those addresses, and appends newly discovered NFT
 contract addresses to a text file.
 
+Notable reliability/performance improvements:
+- Enforces block-number and parent-hash continuity when verification is enabled.
+- Constant-amortized-time empty-wallet TTL/LRU maintenance.
+- De-duplicates wallet lookups within a processing batch.
+- Handles worker startup errors without orphaning background tasks.
+- Rejects invalid non-finite configuration values.
+- Avoids expensive serialization of successful block RPC responses.
+
 Major changes over v7:
 - Checkpoint v3 binds state to CHAIN_ID, preventing accidental cross-chain resume.
 - Newly created append files fsync their parent directory when durability is enabled.
@@ -46,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import signal
@@ -163,55 +172,58 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # With slots=True, defaults.field is a member descriptor, not its default.
+        # Read defaults from an instance so unset environment variables work.
+        defaults = cls(api_keys=())
         return cls(
             api_keys=env_keys("ETHERSCAN_API_KEYS"),
-            chain_id=env_int("CHAIN_ID", cls.chain_id),
-            base_url=os.getenv("ETHERSCAN_BASE_URL", cls.base_url).strip(),
-            output_file=Path(os.getenv("OUTPUT_FILE", str(cls.output_file))),
+            chain_id=env_int("CHAIN_ID", defaults.chain_id),
+            base_url=os.getenv("ETHERSCAN_BASE_URL", defaults.base_url).strip(),
+            output_file=Path(os.getenv("OUTPUT_FILE", str(defaults.output_file))),
             known_contracts_file=Path(
-                os.getenv("KNOWN_CONTRACTS_FILE", str(cls.known_contracts_file))
+                os.getenv("KNOWN_CONTRACTS_FILE", str(defaults.known_contracts_file))
             ),
-            checkpoint_file=Path(os.getenv("CHECKPOINT_FILE", str(cls.checkpoint_file))),
-            request_timeout=env_float("REQUEST_TIMEOUT", cls.request_timeout),
-            connect_timeout=env_float("CONNECT_TIMEOUT", cls.connect_timeout),
-            max_retries=env_int("MAX_RETRIES", cls.max_retries),
-            min_backoff=env_float("MIN_BACKOFF", cls.min_backoff),
-            max_backoff=env_float("MAX_BACKOFF", cls.max_backoff),
-            workers=env_int("WORKERS", cls.workers),
-            global_rps=env_float("GLOBAL_RPS", cls.global_rps),
-            token_bucket_size=env_int("TOKEN_BUCKET_SIZE", cls.token_bucket_size),
-            address_queue_size=env_int("ADDRESS_QUEUE_SIZE", cls.address_queue_size),
-            tcp_limit=env_int("TCP_LIMIT", cls.tcp_limit),
-            tcp_limit_per_host=env_int("TCP_LIMIT_PER_HOST", cls.tcp_limit_per_host),
-            dns_cache_ttl=env_int("DNS_CACHE_TTL", cls.dns_cache_ttl),
-            confirmations=env_int("CONFIRMATIONS", cls.confirmations),
+            checkpoint_file=Path(os.getenv("CHECKPOINT_FILE", str(defaults.checkpoint_file))),
+            request_timeout=env_float("REQUEST_TIMEOUT", defaults.request_timeout),
+            connect_timeout=env_float("CONNECT_TIMEOUT", defaults.connect_timeout),
+            max_retries=env_int("MAX_RETRIES", defaults.max_retries),
+            min_backoff=env_float("MIN_BACKOFF", defaults.min_backoff),
+            max_backoff=env_float("MAX_BACKOFF", defaults.max_backoff),
+            workers=env_int("WORKERS", defaults.workers),
+            global_rps=env_float("GLOBAL_RPS", defaults.global_rps),
+            token_bucket_size=env_int("TOKEN_BUCKET_SIZE", defaults.token_bucket_size),
+            address_queue_size=env_int("ADDRESS_QUEUE_SIZE", defaults.address_queue_size),
+            tcp_limit=env_int("TCP_LIMIT", defaults.tcp_limit),
+            tcp_limit_per_host=env_int("TCP_LIMIT_PER_HOST", defaults.tcp_limit_per_host),
+            dns_cache_ttl=env_int("DNS_CACHE_TTL", defaults.dns_cache_ttl),
+            confirmations=env_int("CONFIRMATIONS", defaults.confirmations),
             max_blocks_per_batch=env_int(
-                "MAX_BLOCKS_PER_BATCH", cls.max_blocks_per_batch
+                "MAX_BLOCKS_PER_BATCH", defaults.max_blocks_per_batch
             ),
             block_poll_interval=env_float(
-                "BLOCK_POLL_INTERVAL", cls.block_poll_interval
+                "BLOCK_POLL_INTERVAL", defaults.block_poll_interval
             ),
-            nft_tx_offset=env_int("NFT_TX_OFFSET", cls.nft_tx_offset),
-            nft_tx_pages=env_int("NFT_TX_PAGES", cls.nft_tx_pages),
+            nft_tx_offset=env_int("NFT_TX_OFFSET", defaults.nft_tx_offset),
+            nft_tx_pages=env_int("NFT_TX_PAGES", defaults.nft_tx_pages),
             empty_wallet_cache_size=env_int(
-                "EMPTY_WALLET_CACHE_SIZE", cls.empty_wallet_cache_size
+                "EMPTY_WALLET_CACHE_SIZE", defaults.empty_wallet_cache_size
             ),
             empty_wallet_cache_ttl=env_float(
-                "EMPTY_WALLET_CACHE_TTL", cls.empty_wallet_cache_ttl
+                "EMPTY_WALLET_CACHE_TTL", defaults.empty_wallet_cache_ttl
             ),
-            write_buffer_size=env_int("WRITE_BUFFER_SIZE", cls.write_buffer_size),
-            stats_interval=env_float("STATS_INTERVAL", cls.stats_interval),
+            write_buffer_size=env_int("WRITE_BUFFER_SIZE", defaults.write_buffer_size),
+            stats_interval=env_float("STATS_INTERVAL", defaults.stats_interval),
             api_key_cooldown_sec=env_float(
-                "API_KEY_COOLDOWN_SEC", cls.api_key_cooldown_sec
+                "API_KEY_COOLDOWN_SEC", defaults.api_key_cooldown_sec
             ),
-            start_block=env_int("START_BLOCK", cls.start_block),
-            fsync_writes=env_bool("FSYNC_WRITES", cls.fsync_writes),
+            start_block=env_int("START_BLOCK", defaults.start_block),
+            fsync_writes=env_bool("FSYNC_WRITES", defaults.fsync_writes),
             verify_checkpoint_hash=env_bool(
-                "VERIFY_CHECKPOINT_HASH", cls.verify_checkpoint_hash
+                "VERIFY_CHECKPOINT_HASH", defaults.verify_checkpoint_hash
             ),
-            log_level=os.getenv("LOG_LEVEL", cls.log_level).upper(),
-            user_agent=os.getenv("USER_AGENT", cls.user_agent).strip()
-            or cls.user_agent,
+            log_level=os.getenv("LOG_LEVEL", defaults.log_level).upper(),
+            user_agent=os.getenv("USER_AGENT", defaults.user_agent).strip()
+            or defaults.user_agent,
         )
 
     def validate(self) -> None:
@@ -245,20 +257,30 @@ class Config:
             raise ValueError("NFT_TX_OFFSET must be <= 1000")
         if self.tcp_limit_per_host > self.tcp_limit:
             raise ValueError("TCP_LIMIT_PER_HOST must be <= TCP_LIMIT")
-        if self.global_rps <= 0:
-            raise ValueError("GLOBAL_RPS must be > 0")
+        finite_positive = {
+            "GLOBAL_RPS": self.global_rps,
+            "REQUEST_TIMEOUT": self.request_timeout,
+            "CONNECT_TIMEOUT": self.connect_timeout,
+            "BLOCK_POLL_INTERVAL": self.block_poll_interval,
+            "STATS_INTERVAL": self.stats_interval,
+            "API_KEY_COOLDOWN_SEC": self.api_key_cooldown_sec,
+        }
+        for name, value in finite_positive.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and > 0")
+        for name, value in {
+            "MIN_BACKOFF": self.min_backoff,
+            "MAX_BACKOFF": self.max_backoff,
+            "EMPTY_WALLET_CACHE_TTL": self.empty_wallet_cache_ttl,
+        }.items():
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and >= 0")
         if self.request_timeout <= 0 or self.connect_timeout <= 0:
             raise ValueError("REQUEST_TIMEOUT and CONNECT_TIMEOUT must be > 0")
         if self.connect_timeout > self.request_timeout:
             raise ValueError("CONNECT_TIMEOUT must be <= REQUEST_TIMEOUT")
-        if self.block_poll_interval <= 0 or self.stats_interval <= 0:
-            raise ValueError("BLOCK_POLL_INTERVAL and STATS_INTERVAL must be > 0")
-        if self.api_key_cooldown_sec <= 0:
-            raise ValueError("API_KEY_COOLDOWN_SEC must be > 0")
-        if self.empty_wallet_cache_size < 0 or self.empty_wallet_cache_ttl < 0:
-            raise ValueError(
-                "EMPTY_WALLET_CACHE_SIZE and EMPTY_WALLET_CACHE_TTL must be >= 0"
-            )
+        if self.empty_wallet_cache_size < 0:
+            raise ValueError("EMPTY_WALLET_CACHE_SIZE must be >= 0")
         if self.confirmations < 0 or self.start_block < 0:
             raise ValueError("CONFIRMATIONS and START_BLOCK must be >= 0")
         if self.min_backoff < 0 or self.max_backoff < self.min_backoff:
@@ -333,12 +355,17 @@ async def sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> bool:
 
 
 class ExpiringLRUSet:
-    """Bounded LRU set whose entries expire after ttl seconds."""
+    """Bounded LRU with TTL expiry in amortized O(1) per operation.
+
+    The LRU order changes on hits, but expiry order changes only on insertion
+    or refresh. Keeping both avoids scanning 200,000 entries on every add.
+    """
 
     def __init__(self, max_size: int, ttl: float):
         self.max_size = max_size
         self.ttl = ttl
         self._data: OrderedDict[str, float] = OrderedDict()
+        self._expiry_order: OrderedDict[str, float] = OrderedDict()
 
     def __contains__(self, key: str) -> bool:
         if self.max_size <= 0 or self.ttl <= 0:
@@ -346,9 +373,9 @@ class ExpiringLRUSet:
         expires_at = self._data.get(key)
         if expires_at is None:
             return False
-        now = monotonic()
-        if expires_at <= now:
+        if expires_at <= monotonic():
             self._data.pop(key, None)
+            self._expiry_order.pop(key, None)
             return False
         self._data.move_to_end(key)
         return True
@@ -357,25 +384,25 @@ class ExpiringLRUSet:
         if self.max_size <= 0 or self.ttl <= 0:
             return
         now = monotonic()
-        self._data[key] = now + self.ttl
+        expires_at = now + self.ttl
+        self._data[key] = expires_at
         self._data.move_to_end(key)
+        self._expiry_order[key] = expires_at
+        self._expiry_order.move_to_end(key)
         self._prune(now)
 
     def _prune(self, now: Optional[float] = None) -> None:
-        if not self._data:
-            return
         now = monotonic() if now is None else now
-
-        # Membership hits move entries, so expired items are not guaranteed to
-        # be clustered at the front.
-        expired = [
-            key for key, expires_at in self._data.items() if expires_at <= now
-        ]
-        for key in expired:
+        while self._expiry_order:
+            key, expires_at = next(iter(self._expiry_order.items()))
+            if expires_at > now:
+                break
+            self._expiry_order.popitem(last=False)
             self._data.pop(key, None)
 
         while len(self._data) > self.max_size:
-            self._data.popitem(last=False)
+            key, _ = self._data.popitem(last=False)
+            self._expiry_order.pop(key, None)
 
     def __len__(self) -> int:
         self._prune()
@@ -753,6 +780,7 @@ class BlockData:
     number: int
     block_hash: str
     addresses: set[str]
+    parent_hash: Optional[str] = None
 
 
 class EtherscanClient:
@@ -792,6 +820,9 @@ class EtherscanClient:
         last_error: Optional[BaseException] = None
 
         for attempt in range(1, self.config.max_retries + 1):
+            # Pick the key immediately before sending, not before waiting for
+            # the global limiter (its cooldown may change during that wait).
+            await self.limiter.acquire()
             key = await self.keys.acquire()
             query = {
                 "chainid": str(self.config.chain_id),
@@ -807,7 +838,6 @@ class EtherscanClient:
 
             delay = 0.0
             try:
-                await self.limiter.acquire()
                 async with self.session.get(
                     self.config.base_url, params=query
                 ) as response:
@@ -905,7 +935,9 @@ class EtherscanClient:
             return None
         value = value.strip()
         try:
-            return max(0.1, float(value))
+            seconds = float(value)
+            if math.isfinite(seconds):
+                return max(0.1, seconds)
         except ValueError:
             pass
 
@@ -922,9 +954,12 @@ class EtherscanClient:
 
     def _classify_envelope(self, data: Mapping[str, Any]) -> None:
         result = data.get("result")
+        # A successful proxy block may contain thousands of transactions.
+        # Avoid stringifying that entire payload solely for error detection.
         combined = " ".join(
-            str(data.get(name, "")).lower()
-            for name in ("status", "message", "result")
+            str(value).lower()
+            for value in (data.get("status", ""), data.get("message", ""), result)
+            if isinstance(value, (str, int))
         )
 
         if any(marker in combined for marker in self.RATE_LIMIT_MARKERS):
@@ -951,12 +986,12 @@ class EtherscanClient:
         message = str(data.get("message", "")).strip().lower()
         result_text = str(result).strip().lower()
         return (
-            (result == [] and message in {"", "ok", "no transactions found"})
-            or "no transactions found" in result_text
-            or (
-                message == "no transactions found"
-                and result in (None, "", [])
-            )
+            result in (None, "", []) and message == "no transactions found"
+        ) or (
+            result == [] and message in {"", "ok"}
+        ) or (
+            result_text == "no transactions found"
+            and message in {"", "ok", "no transactions found"}
         )
 
     async def latest_block(self) -> int:
@@ -997,7 +1032,19 @@ class EtherscanClient:
             raise RetryableAPIError(
                 f"Block {block_number} has invalid hash"
             )
+        if self._block_number(block) != block_number:
+            raise RetryableAPIError(f"Block number mismatch for {block_number}")
         return block_hash
+
+    @staticmethod
+    def _block_number(block: Mapping[str, Any]) -> Optional[int]:
+        raw = block.get("number")
+        if not isinstance(raw, str) or not raw.startswith("0x"):
+            return None
+        try:
+            return int(raw, 16)
+        except ValueError:
+            return None
 
     async def block_data(self, block_number: int) -> BlockData:
         data = await self.request(
@@ -1022,6 +1069,12 @@ class EtherscanClient:
                 f"Block {block_number} has invalid hash"
             )
 
+        if self._block_number(block) != block_number:
+            raise RetryableAPIError(f"Block number mismatch for {block_number}")
+        parent_hash = normalize_hash(block.get("parentHash"))
+        if parent_hash is None:
+            raise RetryableAPIError(f"Block {block_number} has invalid parentHash")
+
         transactions = block.get("transactions")
         if not isinstance(transactions, list):
             raise RetryableAPIError(
@@ -1030,17 +1083,41 @@ class EtherscanClient:
 
         addresses: set[str] = set()
         for tx in transactions:
+            # A response containing transaction hashes instead of expanded
+            # objects (or malformed participants) must never be checkpointed.
             if not isinstance(tx, dict):
-                continue
-            for field in ("from", "to"):
-                address = normalize_address(tx.get(field))
-                if address:
-                    addresses.add(address)
+                raise RetryableAPIError(
+                    f"Block {block_number} contains a non-object transaction"
+                )
+            sender_value = tx.get("from")
+            sender = normalize_address(sender_value)
+            if sender is not None:
+                addresses.add(sender)
+            elif not (
+                isinstance(sender_value, str)
+                and sender_value.strip().lower() == ZERO_ADDRESS
+            ):
+                raise RetryableAPIError(
+                    f"Block {block_number} contains a transaction with invalid from"
+                )
+
+            recipient_value = tx.get("to")
+            recipient = normalize_address(recipient_value)
+            if recipient is not None:
+                addresses.add(recipient)
+            elif recipient_value is not None and not (
+                isinstance(recipient_value, str)
+                and recipient_value.strip().lower() == ZERO_ADDRESS
+            ):
+                raise RetryableAPIError(
+                    f"Block {block_number} contains a transaction with invalid to"
+                )
 
         return BlockData(
             number=block_number,
             block_hash=block_hash,
             addresses=addresses,
+            parent_hash=parent_hash,
         )
 
     async def nft_contracts_for_address(self, address: str) -> set[str]:
@@ -1093,25 +1170,17 @@ class EtherscanClient:
                     )
                 seen_page_fingerprints.add(fingerprint)
 
-            valid_rows = 0
             for transfer in result:
                 if not isinstance(transfer, dict):
-                    continue
-                contract = normalize_address(
-                    transfer.get("contractAddress")
-                )
-                if contract:
-                    contracts.add(contract)
-                    valid_rows += 1
-
-            # If Etherscan claims it returned rows but every row has lost the
-            # expected contractAddress schema, fail closed instead of caching the
-            # wallet as empty.
-            if result and valid_rows == 0:
-                raise RetryableAPIError(
-                    f"tokennfttx returned {len(result)} rows for {address} "
-                    "but none had a valid contractAddress"
-                )
+                    raise RetryableAPIError(
+                        f"tokennfttx returned a non-object row for {address}"
+                    )
+                contract = normalize_address(transfer.get("contractAddress"))
+                if contract is None:
+                    raise RetryableAPIError(
+                        f"tokennfttx returned an invalid contractAddress for {address}"
+                    )
+                contracts.add(contract)
 
             if len(result) < self.config.nft_tx_offset:
                 break
@@ -1189,6 +1258,11 @@ async def guarded_queue_put(
 ) -> None:
     """Put without risking a permanent producer hang after worker failure."""
     monitor.raise_if_failed()
+    try:
+        queue.put_nowait(address)
+        return
+    except asyncio.QueueFull:
+        pass
 
     put_task = asyncio.create_task(
         queue.put(address),
@@ -1389,12 +1463,25 @@ async def run(config: Config) -> None:
             stop_event.set()
 
     installed_signals: list[signal.Signals] = []
+    fallback_signals: dict[signal.Signals, Any] = {}
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, request_shutdown)
             installed_signals.append(sig)
-        except (NotImplementedError, RuntimeError):
-            pass
+        except (NotImplementedError, RuntimeError, ValueError):
+            # Proactor/Selector event loops on Windows do not implement
+            # add_signal_handler. Install a synchronous fallback instead.
+            try:
+                previous = signal.getsignal(sig)
+                signal.signal(
+                    sig,
+                    lambda _signum, _frame: loop.call_soon_threadsafe(
+                        request_shutdown
+                    ),
+                )
+                fallback_signals[sig] = previous
+            except (OSError, ValueError):
+                pass  # Signals are only configurable on the main thread.
 
     queue: asyncio.Queue[str] = asyncio.Queue(
         maxsize=config.address_queue_size
@@ -1465,6 +1552,28 @@ async def run(config: Config) -> None:
                 logger,
             )
 
+            state = checkpoint.load()
+            last_processed: Optional[int]
+            last_processed_hash: Optional[str]
+
+            if state is not None:
+                last_processed = state.last_processed_block
+                last_processed_hash = state.last_processed_block_hash
+                logger.info("Resuming after block %d", last_processed)
+                await verify_checkpoint(state, client, config, logger)
+
+            elif config.start_block > 0:
+                last_processed = config.start_block - 1
+                last_processed_hash = None
+                logger.info(
+                    "Starting at configured block %d",
+                    config.start_block,
+                )
+
+            else:
+                last_processed = None
+                last_processed_hash = None
+
             monitor = WorkerFailureMonitor()
             workers = [
                 asyncio.create_task(
@@ -1499,35 +1608,16 @@ async def run(config: Config) -> None:
                 name="stats",
             )
 
-            state = checkpoint.load()
-            last_processed: Optional[int]
-            last_processed_hash: Optional[str]
-
-            if state is not None:
-                last_processed = state.last_processed_block
-                last_processed_hash = state.last_processed_block_hash
-                logger.info("Resuming after block %d", last_processed)
-                await verify_checkpoint(state, client, config, logger)
-
-            elif config.start_block > 0:
-                last_processed = config.start_block - 1
-                last_processed_hash = None
-                logger.info(
-                    "Starting at configured block %d",
-                    config.start_block,
-                )
-
-            else:
-                last_processed = None
-                last_processed_hash = None
-
             try:
                 while not stop_event.is_set():
                     monitor.raise_if_failed()
 
                     try:
                         latest = await client.latest_block()
+                    except PermanentAPIError:
+                        raise
                     except Exception as exc:
+                        monitor.raise_if_failed()
                         logger.error(
                             "Cannot obtain latest block: %s",
                             exc,
@@ -1599,6 +1689,7 @@ async def run(config: Config) -> None:
                     batch_last = last_processed
                     batch_last_hash = last_processed_hash
                     batch_failed = False
+                    batch_addresses: set[str] = set()
 
                     for block_number in range(
                         last_processed + 1,
@@ -1619,6 +1710,20 @@ async def run(config: Config) -> None:
                             batch_failed = True
                             break
 
+                        # A block must extend the last committed/processed
+                        # block. Checking only on startup misses a reorg while
+                        # the scanner has been running.
+                        if (
+                            config.verify_checkpoint_hash
+                            and batch_last_hash is not None
+                            and block.parent_hash != batch_last_hash
+                        ):
+                            raise RuntimeError(
+                                f"Chain reorg at block {block_number}: "
+                                f"parent={block.parent_hash}, expected={batch_last_hash}. "
+                                "Refusing to checkpoint a discontinuous chain."
+                            )
+
                         await stats.inc(
                             blocks=1,
                             addresses_seen=len(block.addresses),
@@ -1635,7 +1740,9 @@ async def run(config: Config) -> None:
                             if address in empty_wallets:
                                 cache_hits += 1
                                 continue
-                            if address in in_flight:
+                            # De-duplicate for the entire batch: quick workers
+                            # can finish before the next block is enqueued.
+                            if address in batch_addresses or address in in_flight:
                                 continue
 
                             in_flight.add(address)
@@ -1648,6 +1755,7 @@ async def run(config: Config) -> None:
                             except BaseException:
                                 in_flight.discard(address)
                                 raise
+                            batch_addresses.add(address)
                             enqueued += 1
 
                         await stats.inc(
@@ -1749,7 +1857,12 @@ async def run(config: Config) -> None:
         for sig in installed_signals:
             try:
                 loop.remove_signal_handler(sig)
-            except (NotImplementedError, RuntimeError):
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+        for sig, previous in fallback_signals.items():
+            try:
+                signal.signal(sig, previous)
+            except (OSError, ValueError):
                 pass
 
     if final_snapshot is None:
