@@ -7,6 +7,10 @@ recent ERC-721 transfers for those addresses, and appends newly discovered NFT
 contract addresses to a text file.
 
 Notable reliability/performance improvements:
+- Refuses concurrent scanner instances sharing a checkpoint.
+- Interrupts a full producer queue when shutdown is requested.
+- Preserves complete contract lines when appending to a file missing a newline.
+- Rejects checkpoint/output filename collisions and fatal block API errors.
 - Enforces block-number and parent-hash continuity when verification is enabled.
 - Constant-amortized-time empty-wallet TTL/LRU maintenance.
 - De-duplicates wallet lookups within a processing batch.
@@ -61,12 +65,13 @@ import signal
 import sys
 import tempfile
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -283,8 +288,15 @@ class Config:
             raise ValueError("EMPTY_WALLET_CACHE_SIZE must be >= 0")
         if self.confirmations < 0 or self.start_block < 0:
             raise ValueError("CONFIRMATIONS and START_BLOCK must be >= 0")
-        if self.min_backoff < 0 or self.max_backoff < self.min_backoff:
+        if self.max_backoff < self.min_backoff:
             raise ValueError("Backoff values are invalid")
+
+        # A checkpoint must never be overwritten with newline-delimited contracts.
+        checkpoint_path = self.checkpoint_file.resolve()
+        if checkpoint_path in {
+            self.output_file.resolve(), self.known_contracts_file.resolve()
+        }:
+            raise ValueError("CHECKPOINT_FILE must differ from contract files")
 
         level = getattr(logging, self.log_level, None)
         if not isinstance(level, int):
@@ -339,8 +351,14 @@ def utc_now_iso() -> str:
 def retry_delay(attempt: int, minimum: float, maximum: float) -> float:
     if minimum <= 0:
         return 0.0
-    ceiling = min(maximum, minimum * (2 ** max(0, attempt - 1)))
-    return random.uniform(minimum, max(minimum, ceiling))
+    # Never construct an enormous integer for arbitrarily large MAX_RETRIES.
+    # Even the widest finite float range saturates in about 2,100 doublings.
+    ceiling = minimum
+    for _ in range(min(max(0, attempt - 1), 2100)):
+        ceiling = min(maximum, ceiling * 2.0)
+        if ceiling >= maximum:
+            break
+    return random.uniform(minimum, ceiling)
 
 
 async def sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> bool:
@@ -552,6 +570,45 @@ class CheckpointState:
     last_processed_block_hash: Optional[str] = None
 
 
+@contextmanager
+def scanner_instance_lock(checkpoint_path: Path) -> Iterator[None]:
+    """Prevent separate scanner processes from corrupting shared checkpoint/output.
+
+    Use an OS advisory lock, not a removable PID/sentinel file: a crash releases
+    the OS lock automatically, and retaining the lock file avoids unlink races.
+    """
+    resolved = checkpoint_path.resolve()
+    lock_path = resolved.with_name(resolved.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot acquire scanner lock {lock_path}; "
+                "another instance may be using these files"
+            ) from exc
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _fsync_directory_sync(path: Path) -> None:
     if os.name == "nt":
         return
@@ -602,9 +659,14 @@ def _atomic_json_write_sync(path: Path, payload: Mapping[str, Any], fsync: bool)
 def _append_lines_sync(path: Path, lines: list[str], fsync: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write("\n".join(lines))
-        handle.write("\n")
+    with path.open("a+b") as handle:
+        # A manually edited or interrupted output might lack its final newline.
+        # Never concatenate the next contract address onto that partial line.
+        if handle.seek(0, os.SEEK_END):
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                handle.write(b"\n")
+        handle.write(("\n".join(lines) + "\n").encode("ascii"))
         handle.flush()
         if fsync:
             os.fsync(handle.fileno())
@@ -867,7 +929,11 @@ class EtherscanClient:
                     if not isinstance(data, dict):
                         raise RetryableAPIError("API returned non-object JSON")
 
-                    self._classify_envelope(data)
+                    self._classify_envelope(
+                        data, allow_empty_account=(
+                            module == "account" and action == "tokennfttx"
+                        ),
+                    )
                     return data
 
             except RateLimitError as exc:
@@ -952,39 +1018,48 @@ class EtherscanClient:
         except (TypeError, ValueError, OverflowError):
             return None
 
-    def _classify_envelope(self, data: Mapping[str, Any]) -> None:
+    def _classify_envelope(
+        self, data: Mapping[str, Any], *, allow_empty_account: bool = False
+    ) -> None:
         result = data.get("result")
+        error = data.get("error")
+        error_message = (
+            error.get("message", "") if isinstance(error, dict) else error
+        )
         # A successful proxy block may contain thousands of transactions.
-        # Avoid stringifying that entire payload solely for error detection.
+        # Inspect only small scalar status/error fields, never serialize the block.
         combined = " ".join(
             str(value).lower()
-            for value in (data.get("status", ""), data.get("message", ""), result)
+            for value in (
+                data.get("status", ""), data.get("message", ""),
+                result, error_message,
+            )
             if isinstance(value, (str, int))
         )
 
-        if any(marker in combined for marker in self.RATE_LIMIT_MARKERS):
-            raise RateLimitError(combined[:240])
+        if (isinstance(error, dict) and error.get("code") in (429, -32005)) or any(
+            marker in combined for marker in self.RATE_LIMIT_MARKERS
+        ):
+            raise RateLimitError(combined[:240] or "API rate limit")
         if any(marker in combined for marker in self.TRANSIENT_MARKERS):
             raise RetryableAPIError(combined[:240])
 
-        if data.get("error") is not None:
-            raise RetryableAPIError(f"JSON-RPC error: {data['error']!r}")
+        if error is not None:
+            raise RetryableAPIError(f"JSON-RPC error: {error!r}")
 
-        if str(data.get("status", "")) == "0" and not self._is_empty_account_result(
-            data
-        ):
-            raise PermanentAPIError(
-                f"Etherscan API error: {combined[:300]}"
-            )
+        is_empty_account = allow_empty_account and self._is_empty_account_result(data)
+        if str(data.get("status", "")) == "0" and not is_empty_account:
+            raise PermanentAPIError(f"Etherscan API error: {combined[:300]}")
 
-        if result is None:
+        if result is None and not is_empty_account:
             raise RetryableAPIError("API response has no result")
 
     @staticmethod
     def _is_empty_account_result(data: Mapping[str, Any]) -> bool:
         result = data.get("result")
         message = str(data.get("message", "")).strip().lower()
-        result_text = str(result).strip().lower()
+        # Do not stringify an entire successful NFT transfer page.
+        result_text = result.strip().lower() if isinstance(result, str) else ""
         return (
             result in (None, "", []) and message == "no transactions found"
         ) or (
@@ -1136,10 +1211,7 @@ class EtherscanClient:
             await self.stats.inc(nft_pages=1)
 
             result = data.get("result")
-            if (
-                isinstance(result, str)
-                and "no transactions found" in result.lower()
-            ):
+            if self._is_empty_account_result(data):
                 break
             if not isinstance(result, list):
                 raise RetryableAPIError(
@@ -1255,12 +1327,15 @@ async def guarded_queue_put(
     queue: asyncio.Queue[str],
     address: str,
     monitor: WorkerFailureMonitor,
-) -> None:
-    """Put without risking a permanent producer hang after worker failure."""
+    stop_event: Optional[asyncio.Event] = None,
+) -> bool:
+    """Enqueue or return False on shutdown, without hanging on a dead worker."""
     monitor.raise_if_failed()
+    if stop_event is not None and stop_event.is_set():
+        return False
     try:
         queue.put_nowait(address)
-        return
+        return True
     except asyncio.QueueFull:
         pass
 
@@ -1272,33 +1347,32 @@ async def guarded_queue_put(
         monitor.wait(),
         name="worker-failure-wait",
     )
+    stop_task = (
+        asyncio.create_task(stop_event.wait(), name="producer-stop-wait")
+        if stop_event is not None else None
+    )
+    tasks = {put_task, monitor_task}
+    if stop_task is not None:
+        tasks.add(stop_task)
 
     try:
-        done, _ = await asyncio.wait(
-            {put_task, monitor_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        # Worker failure wins if both became ready in the same event-loop turn.
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # Worker failure takes precedence even if the queued put also finished.
         monitor.raise_if_failed()
-
-        if put_task in done:
+        # A completed put must be accounted for even if shutdown was signalled
+        # during the same event-loop iteration.
+        if put_task.done():
             await put_task
-            return
-
-        # Defensive fallback; normally raise_if_failed() above has raised.
+            return True
+        if stop_task is not None and stop_task.done():
+            return False
         await monitor_task
         raise RuntimeError("Worker monitor stopped unexpectedly")
-
     finally:
-        for task in (put_task, monitor_task):
+        for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(
-            put_task,
-            monitor_task,
-            return_exceptions=True,
-        )
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def wait_for_queue_or_worker_failure(
@@ -1441,7 +1515,13 @@ async def verify_checkpoint(
 
 
 async def run(config: Config) -> None:
+    """Run exactly one scanner against a checkpoint and its contract files."""
     config.validate()
+    with scanner_instance_lock(config.checkpoint_file):
+        await _run_locked(config)
+
+
+async def _run_locked(config: Config) -> None:
     logger = setup_logging(config.log_level)
     logger.info(
         "Starting NFT Scanner v8: chain=%d workers=%d rps=%.2f "
@@ -1528,7 +1608,9 @@ async def run(config: Config) -> None:
         limit=config.tcp_limit,
         limit_per_host=config.tcp_limit_per_host,
         ttl_dns_cache=config.dns_cache_ttl,
-        enable_cleanup_closed=True,
+        # The underlying CPython SSL transport leak is fixed in 3.13.5+;
+        # newer aiohttp versions warn when this workaround is enabled there.
+        enable_cleanup_closed=sys.version_info < (3, 13, 5),
     )
     headers = {
         "User-Agent": config.user_agent,
@@ -1701,6 +1783,8 @@ async def run(config: Config) -> None:
 
                         try:
                             block = await client.block_data(block_number)
+                        except PermanentAPIError:
+                            raise
                         except Exception as exc:
                             logger.error(
                                 "Block %d was not processed and will be retried: %s",
@@ -1747,14 +1831,18 @@ async def run(config: Config) -> None:
 
                             in_flight.add(address)
                             try:
-                                await guarded_queue_put(
+                                queued = await guarded_queue_put(
                                     queue,
                                     address,
                                     monitor,
+                                    stop_event,
                                 )
                             except BaseException:
                                 in_flight.discard(address)
                                 raise
+                            if not queued:
+                                in_flight.discard(address)
+                                break
                             batch_addresses.add(address)
                             enqueued += 1
 
